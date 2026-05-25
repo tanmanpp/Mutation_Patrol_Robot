@@ -265,34 +265,6 @@ these command-line tools:
 - `samtools`
 - `bcftools`
 
-## Smoke Tests
-
-Build a tiny test gene database:
-
-```bash
-python build_gene_db.py \
-  --ref_fasta test_data/tiny_reference.fa \
-  --annotation test_data/tiny_annotation.jsonl test_data/tiny_annotation_2.jsonl \
-  --out_dir test_data/tiny_gene_db \
-  --force
-```
-
-Analyze a tiny pre-made VCF through the sample pipeline:
-
-```bash
-python analyze_sample.py \
-  --gene_db test_data/tiny_gene_db/gene_database.json \
-  --out_dir test_data/tiny_analysis \
-  --skip_mapping --skip_roi --skip_variant \
-  --force
-```
-
-Expected mutation table row:
-
-```text
-TEST_AMR,TINY_CHR,7,A,G,...,SNV,4,1,AAA,GAA,2,K,E,K2E
-```
-
 ## Legacy Pipeline
 
 `pipeline.py` remains available as a compatibility script, but new work should
