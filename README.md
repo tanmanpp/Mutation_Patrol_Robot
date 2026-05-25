@@ -255,6 +255,8 @@ The output uses the same columns as `mutation_candidates.csv`, including
 and `allele_freq=0.000000`. When `--alt` is not set, non-reference alleles are
 reported only when they pass `--min_alt_freq`, which defaults to `0.05`.
 
+![Site query result](docs/site_query_result.png)
+
 ## Requirements
 
 The Python code uses only the standard library. The full sample workflow expects
