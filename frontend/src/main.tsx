@@ -39,6 +39,20 @@ type ResultPayload = {
   sample_summary: Record<string, string>[];
   mutation_candidates: Record<string, string>[];
   site_query: Record<string, string>[];
+  site_queries?: SiteQueryResult[];
+};
+
+type SiteQueryResult = {
+  query_id: string;
+  path: string;
+  updated_at: number;
+  rows: Record<string, string>[];
+};
+
+type UploadStats = {
+  total_bytes: number;
+  file_count: number;
+  dir_count: number;
 };
 
 function Field(props: { label: string; children: React.ReactNode }) {
@@ -79,6 +93,18 @@ function DataTable({ rows, empty }: { rows: Record<string, string>[]; empty: str
       </table>
     </div>
   );
+}
+
+function formatBytes(bytes: number) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = bytes;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  return `${value >= 10 || unitIndex === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unitIndex]}`;
 }
 
 const PAGE_SIZE = 20;
@@ -196,13 +222,14 @@ function parseNumber(value: string | undefined) {
 
 function siteQueryLabel(row: Record<string, string>) {
   const gene = row["Gene symbol"] || row.gene || "";
+  const geneName = row["Gene name"] || gene;
   const aaPos = row.aa_pos || "";
   const aaChange = row.aa_change && row.aa_change !== "NA" ? row.aa_change : "";
   const position = aaPos || row.pos || "";
   const allele = row.alt_codon || row.alt || "";
-  if (aaChange) return `${gene} ${aaChange}`;
-  if (position && allele) return `${gene} ${position} ${allele}`;
-  return `${gene} ${position}`.trim();
+  if (aaChange) return `${geneName} ${aaChange}`;
+  if (position && allele) return `${geneName} ${position} ${allele}`;
+  return `${geneName} ${position}`.trim();
 }
 
 function siteQueryChartData(rows: Record<string, string>[]): SiteChartDatum[] {
@@ -225,7 +252,14 @@ function sitePositionKey(item: SiteChartDatum) {
 }
 
 function sitePositionLabel(item: SiteChartDatum) {
-  return item.gene && item.position ? `${item.gene} ${item.position}` : item.label;
+  const geneName = item.geneDescription || item.gene;
+  return geneName && item.position ? `${geneName} ${item.position}` : item.label;
+}
+
+function siteQueryDisplayName(query: SiteQueryResult) {
+  const firstRow = query.rows?.[0];
+  const geneName = firstRow?.["Gene name"];
+  return geneName || query.query_id;
 }
 
 function siteQueryCombinedData(data: SiteChartDatum[]): SiteCombinedDatum[] {
@@ -355,6 +389,9 @@ function App() {
   const [statusLog, setStatusLog] = useState<string[]>(["Ready"]);
   const [result, setResult] = useState<ResultPayload | null>(null);
   const [results, setResults] = useState<ResultPayload[]>([]);
+  const [selectedResultId, setSelectedResultId] = useState("");
+  const [selectedSiteQueryId, setSelectedSiteQueryId] = useState("");
+  const [uploadStats, setUploadStats] = useState<UploadStats>({ total_bytes: 0, file_count: 0, dir_count: 0 });
 
   function pushStatus(message: string) {
     setStatus(message);
@@ -377,10 +414,24 @@ function App() {
   useEffect(() => {
     refreshDatabases().catch(() => pushStatus("Backend is not reachable."));
     refreshResults().catch(() => pushStatus("Result list is not reachable."));
+    refreshUploadStats().catch(() => pushStatus("Upload stats are not reachable."));
   }, []);
 
   const currentDb = databases.find((db) => db.name === selectedDb);
   const genes = currentDb?.genes || [];
+  const selectedSiteQuery = useMemo(() => {
+    const queries = result?.site_queries || [];
+    if (!queries.length) return null;
+    return queries.find((query) => query.query_id === selectedSiteQueryId) || queries[queries.length - 1];
+  }, [result, selectedSiteQueryId]);
+  const selectedSiteQueryRows = selectedSiteQuery?.rows || result?.site_query || [];
+
+  function setLoadedResult(payload: ResultPayload) {
+    setResult(payload);
+    setSelectedResultId(payload.run_id);
+    const queries = payload.site_queries || [];
+    setSelectedSiteQueryId(queries[queries.length - 1]?.query_id || "");
+  }
 
   async function submitDatabase(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -426,9 +477,31 @@ function App() {
       pushStatus(payload.detail || "Sample analysis failed.");
       return;
     }
-    setResult(payload);
+    setLoadedResult(payload);
+    await refreshResults(payload.run_id);
     pushStatus(`Analysis complete: ${payload.run_id}`);
     setActive("results");
+  }
+
+  async function clearSampleUploads() {
+    const confirmed = window.confirm(
+      "Clear uploaded sample files? Existing analysis results will not be deleted."
+    );
+    if (!confirmed) return;
+
+    pushStatus("Clearing uploaded sample files...");
+    const response = await fetch(`${API_BASE}/api/uploads/samples`, { method: "DELETE" });
+    const payload = await response.json();
+    if (!response.ok) {
+      pushStatus(payload.detail || "Failed to clear uploaded sample files.");
+      return;
+    }
+    setUploadStats({
+      total_bytes: payload.stats?.total_bytes || 0,
+      file_count: payload.stats?.file_count || 0,
+      dir_count: payload.stats?.dir_count || 0,
+    });
+    pushStatus(`Uploaded sample files cleared: ${payload.deleted_files || 0} files, ${formatBytes(payload.deleted_bytes || 0)} removed.`);
   }
 
   async function submitSiteQuery(event: React.FormEvent<HTMLFormElement>) {
@@ -441,26 +514,58 @@ function App() {
       pushStatus(payload.detail || "Site query failed.");
       return;
     }
-    setResult((previous) => ({
-      run_id: payload.run_id,
-      sample_summary: previous?.sample_summary || [],
-      mutation_candidates: previous?.mutation_candidates || [],
-      site_query: payload.rows || [],
-    }));
+    await loadResult(payload.run_id);
     pushStatus(`Site query complete: ${payload.run_id} / ${payload.gene || payload.query_id}`);
     setActive("results");
   }
 
-  async function refreshResults() {
+  async function refreshResults(preferredRunId = selectedResultId) {
     pushStatus("Refreshing result runs...");
     const response = await fetch(`${API_BASE}/api/results`);
     const payload = await response.json();
     const nextResults = payload.results || [];
     setResults(nextResults);
-    if (nextResults.length && !result) {
-      setResult(nextResults[nextResults.length - 1]);
+    const nextSelection = preferredRunId && nextResults.some((run: ResultPayload) => run.run_id === preferredRunId)
+      ? preferredRunId
+      : nextResults[nextResults.length - 1]?.run_id || "";
+    if (nextSelection) {
+      setSelectedResultId(nextSelection);
+      const selected = nextResults.find((run: ResultPayload) => run.run_id === nextSelection);
+      if (selected) setLoadedResult(selected);
+    } else {
+      setSelectedResultId("");
+      setSelectedSiteQueryId("");
+      setResult(null);
     }
     pushStatus(`Result list updated: ${nextResults.length} available.`);
+  }
+
+  async function loadResult(runId: string) {
+    if (!runId) {
+      setSelectedResultId("");
+      setResult(null);
+      return;
+    }
+    pushStatus(`Loading result: ${runId}...`);
+    const response = await fetch(`${API_BASE}/api/results/${encodeURIComponent(runId)}`);
+    const payload = await response.json();
+    if (!response.ok) {
+      pushStatus(payload.detail || `Failed to load result: ${runId}`);
+      return;
+    }
+    setLoadedResult(payload);
+    pushStatus(`Result loaded: ${payload.run_id}`);
+  }
+
+  async function refreshUploadStats() {
+    const response = await fetch(`${API_BASE}/api/uploads/samples`);
+    const payload = await response.json();
+    if (!response.ok) return;
+    setUploadStats({
+      total_bytes: payload.total_bytes || 0,
+      file_count: payload.file_count || 0,
+      dir_count: payload.dir_count || 0,
+    });
   }
 
   return (
@@ -536,7 +641,17 @@ function App() {
 
         {active === "analysis" && (
           <section className="panel">
-            <h2>Sample Analysis</h2>
+            <div className="panelHeader">
+              <h2>Sample Analysis</h2>
+              <button
+                type="button"
+                className="dangerButton"
+                title={`${uploadStats.file_count} uploaded sample files`}
+                onClick={clearSampleUploads}
+              >
+                Clear Sample Uploads ({formatBytes(uploadStats.total_bytes)})
+              </button>
+            </div>
             <form onSubmit={submitAnalysis} className="gridForm">
               <Field label="Run name">
                 <input name="run_name" required placeholder="sample_01" />
@@ -626,9 +741,24 @@ function App() {
           <section className="panel">
             <div className="panelHeader">
               <h2>Results</h2>
-              <button type="button" onClick={async () => {
-                await refreshResults();
-              }}>Load Latest</button>
+              <div className="resultControls">
+                <select
+                  value={selectedResultId}
+                  onChange={(event) => loadResult(event.target.value)}
+                >
+                  <option value="">Select result</option>
+                  {results.map((run) => <option key={run.run_id} value={run.run_id}>{run.run_id}</option>)}
+                </select>
+                <button type="button" onClick={() => refreshResults()}>
+                  Refresh
+                </button>
+                <button type="button" onClick={() => {
+                  const latest = results[results.length - 1];
+                  if (latest) loadResult(latest.run_id);
+                }}>
+                  Load Latest
+                </button>
+              </div>
             </div>
             <div className="resultMeta">
               <span>Sample name</span>
@@ -638,10 +768,21 @@ function App() {
             <DataTable rows={result?.sample_summary || []} empty="No sample summary loaded." />
             <h3>Mutation Candidates</h3>
             <PaginatedSortableTable rows={result?.mutation_candidates || []} empty="No mutation candidates loaded." />
-            <h3>Site Query Charts</h3>
-            <SiteQueryCharts rows={result?.site_query || []} />
+            <div className="sectionHeader">
+              <h3>Site Query Charts</h3>
+              <select
+                value={selectedSiteQuery?.query_id || ""}
+                onChange={(event) => setSelectedSiteQueryId(event.target.value)}
+              >
+                <option value="">Select site query</option>
+                {(result?.site_queries || []).map((query) => (
+                  <option key={query.query_id} value={query.query_id}>{siteQueryDisplayName(query)}</option>
+                ))}
+              </select>
+            </div>
+            <SiteQueryCharts rows={selectedSiteQueryRows} />
             <h3>Site Query</h3>
-            <DataTable rows={result?.site_query || []} empty="No site query loaded." />
+            <DataTable rows={selectedSiteQueryRows} empty="No site query loaded." />
           </section>
         )}
       </section>

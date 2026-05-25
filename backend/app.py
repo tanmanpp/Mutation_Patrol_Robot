@@ -120,6 +120,19 @@ async def analyze_sample(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.delete("/api/uploads/samples")
+def clear_uploaded_samples():
+    try:
+        return services.clear_uploaded_samples()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/uploads/samples")
+def sample_upload_stats():
+    return services.sample_upload_stats()
+
+
 @app.post("/api/site-query")
 async def site_query(
     analysis_run: Annotated[str, Form()],

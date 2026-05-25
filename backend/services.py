@@ -309,6 +309,42 @@ def parse_query_values(value: str):
     return values
 
 
+def clear_uploaded_samples():
+    samples_dir = UPLOADS_DIR / "samples"
+    before = sample_upload_stats()
+    if samples_dir.exists():
+        shutil.rmtree(samples_dir)
+    ensure_dir(samples_dir)
+    return {
+        "cleared": True,
+        "path": relative_path(samples_dir),
+        "deleted_files": before["file_count"],
+        "deleted_dirs": before["dir_count"],
+        "deleted_bytes": before["total_bytes"],
+        "stats": sample_upload_stats(),
+    }
+
+
+def sample_upload_stats():
+    samples_dir = UPLOADS_DIR / "samples"
+    total_bytes = 0
+    file_count = 0
+    dir_count = 0
+    if samples_dir.exists():
+        for path in samples_dir.rglob("*"):
+            if path.is_file():
+                file_count += 1
+                total_bytes += path.stat().st_size
+            elif path.is_dir():
+                dir_count += 1
+    return {
+        "path": relative_path(samples_dir),
+        "total_bytes": total_bytes,
+        "file_count": file_count,
+        "dir_count": dir_count,
+    }
+
+
 def get_result(run_id: str):
     result_dir = RESULTS_DIR / safe_name(run_id)
     tables = result_dir / "tables"
@@ -322,6 +358,7 @@ def get_result(run_id: str):
         "sample_summary": read_csv_records(tables / "sample_summary.csv"),
         "mutation_candidates": read_csv_records(tables / "mutation_candidates.csv", limit=500),
         "site_query": read_latest_site_query(result_dir),
+        "site_queries": read_site_queries(result_dir),
     }
 
 
@@ -334,6 +371,28 @@ def read_latest_site_query(result_dir: Path):
         return []
     latest = max(query_dirs, key=lambda path: path.stat().st_mtime)
     return read_csv_records(latest / "site_query.csv", limit=500)
+
+
+def read_site_queries(result_dir: Path):
+    site_root = result_dir / "site_query"
+    if not site_root.exists():
+        return []
+    items = []
+    query_dirs = sorted(
+        [path for path in site_root.iterdir() if path.is_dir()],
+        key=lambda path: path.stat().st_mtime,
+    )
+    for query_dir in query_dirs:
+        csv_path = query_dir / "site_query.csv"
+        if not csv_path.exists():
+            continue
+        items.append({
+            "query_id": query_dir.name,
+            "path": relative_path(csv_path),
+            "updated_at": query_dir.stat().st_mtime,
+            "rows": read_csv_records(csv_path, limit=500),
+        })
+    return items
 
 
 def list_results():

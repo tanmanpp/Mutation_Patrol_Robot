@@ -134,6 +134,25 @@ nav button.active {
   color: #163238;
 }
 
+.resultControls {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) auto auto;
+  gap: 8px;
+  align-items: center;
+  min-width: min(100%, 520px);
+}
+
+.sectionHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.sectionHeader select {
+  max-width: 280px;
+}
+
 h2,
 h3 {
   margin: 0;
@@ -190,6 +209,18 @@ input[type="file"] {
   background: #1b6656;
   color: #ffffff;
   font-weight: 700;
+}
+
+.dangerButton {
+  border-color: #b85c38;
+  background: #fff5f1;
+  color: #8d351c;
+  font-weight: 700;
+  padding: 8px 12px;
+}
+
+.dangerButton:hover {
+  background: #fde5dc;
 }
 
 .databaseList {
@@ -378,5 +409,19 @@ th {
 
   .chartGrid {
     grid-template-columns: 1fr;
+  }
+
+  .resultControls {
+    grid-template-columns: 1fr;
+    width: 100%;
+  }
+
+  .sectionHeader {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .sectionHeader select {
+    max-width: none;
   }
 }
