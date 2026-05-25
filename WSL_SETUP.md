@@ -1,12 +1,61 @@
 # WSL Setup
 
-Run the web app from WSL so the backend can call Linux bioinformatics tools
-directly.
+Mutation Patrol Robot should be run from **Linux**, **Windows with WSL**, or
+**macOS with conda/bioconda**. Native Windows Python is not recommended because
+the backend calls Linux bioinformatics tools such as `samtools`, `bcftools`,
+and `minimap2`.
 
-## 1. Install Conda in WSL
+This guide is for Windows users running the app through WSL.
 
-Install Miniconda or Miniforge inside WSL. The launcher expects one of these
-folders to exist:
+## Quick Start
+
+1. Install WSL and a Linux distribution, such as Ubuntu.
+2. Install Miniconda or Miniforge inside WSL.
+3. Double-click this file from Windows:
+
+```text
+start_mutation_patrol_robot.bat
+```
+
+The launcher will:
+
+- enter WSL automatically
+- create or reuse the conda environment `mutation_patrol`
+- install Python, Node.js, `samtools`, `bcftools`, and `minimap2`
+- install backend/frontend dependencies
+- build the web UI
+- start the server
+
+When the server is ready, open:
+
+```text
+http://localhost:8000
+```
+
+You do **not** need to manually move into the project folder before using the
+`.bat` file. It detects its own project path.
+
+## Install WSL
+
+Open PowerShell as Administrator and run:
+
+```powershell
+wsl --install
+```
+
+Restart Windows if prompted. Then open Ubuntu from the Start menu once to finish
+creating your Linux user account.
+
+To check that WSL is available:
+
+```powershell
+wsl --list --verbose
+```
+
+## Install Conda Inside WSL
+
+Install Miniconda or Miniforge inside WSL. The launcher looks for conda in one
+of these locations:
 
 ```text
 ~/miniconda3
@@ -15,74 +64,172 @@ folders to exist:
 ~/mambaforge
 ```
 
-The app launcher creates a conda environment named `mutation_patrol` with:
+Miniforge is recommended because it works well with `conda-forge` and
+`bioconda`.
 
-```text
-python, pip, nodejs, samtools, bcftools, minimap2
+After installing conda, close and reopen your WSL terminal, then check:
+
+```bash
+conda --version
 ```
 
-## 2. Enter the Project
+## Conda Environment
 
-If the project is on the Windows `D:` drive:
+The app launcher creates this environment automatically:
+
+```text
+mutation_patrol
+```
+
+It installs:
+
+```text
+python=3.11
+pip
+nodejs
+samtools
+bcftools
+minimap2
+```
+
+You usually do not need to create this environment yourself. The first launch
+may take several minutes because packages and frontend dependencies are
+installed.
+
+## Manual Start from WSL
+
+If you prefer to start the app manually, open WSL and run:
 
 ```bash
 cd /mnt/d/YiLun/parasite_AMR/Mutation_Patrol_Robot
-```
-
-For best performance with large FASTQ/BAM files, copy the project and data into
-the WSL filesystem, for example under `~/projects/Mutation_Patrol_Robot`.
-
-## 3. Start the App from Windows
-
-Double-click:
-
-```text
-start_mutation_patrol_robot.bat
-```
-
-It will enter WSL, activate/create the conda environment, build the UI, and
-start the server. You do not need to move to the project folder first; the bat
-file uses its own location as the project path.
-
-Open:
-
-```text
-http://localhost:8000
-```
-
-## 4. Start the App Manually from WSL
-
-From the project folder:
-
-```bash
 bash scripts/run_app_wsl_conda.sh
 ```
 
-Open:
+Then open:
 
 ```text
 http://localhost:8000
 ```
 
+If your project is in a different folder, replace the `cd` path with your own
+project path.
+
 ## Development Mode
 
-If you are editing the UI and want Vite hot reload, use two WSL terminals
-instead:
+Use this only if you are editing the backend or frontend and want live reload.
+
+Open one WSL terminal for the backend:
 
 ```bash
+cd /mnt/d/YiLun/parasite_AMR/Mutation_Patrol_Robot
 bash scripts/run_backend_wsl.sh
+```
+
+Open another WSL terminal for the frontend:
+
+```bash
+cd /mnt/d/YiLun/parasite_AMR/Mutation_Patrol_Robot
 bash scripts/run_frontend_wsl.sh
 ```
 
-Then open `http://localhost:5173`.
+Then open:
 
-## Notes
+```text
+http://localhost:5173
+```
 
-- The app stores uploaded files and outputs under `app_data/`.
-- Site Query reuses the BAM from a completed analysis run:
-  `app_data/results/<run>/work/bam/merged.sorted.bam`, and writes outputs under
-  `app_data/results/<run>/site_query/<query>/`.
-- The app should run in WSL, not Windows Python, because it calls
-  `samtools`, `bcftools`, and `minimap2`.
-- The UI can be opened from Windows Chrome/Edge using `http://localhost:8000`.
-- If Uvicorn prints a server URL, use `http://localhost:8000` in the browser.
+## Where Files Are Stored
+
+Uploaded files and results are stored under:
+
+```text
+app_data/
+```
+
+Important output folders:
+
+```text
+app_data/databases/
+app_data/results/
+app_data/uploads/
+```
+
+Site Query reuses the BAM from a completed sample analysis:
+
+```text
+app_data/results/<run>/work/bam/merged.sorted.bam
+```
+
+Site Query outputs are written to:
+
+```text
+app_data/results/<run>/site_query/<gene>/site_query.csv
+```
+
+## Performance Note
+
+For small tests, running from the Windows drive is fine:
+
+```text
+/mnt/d/YiLun/parasite_AMR/Mutation_Patrol_Robot
+```
+
+For large FASTQ/BAM files, WSL is faster if the project and data are copied into
+the Linux filesystem, for example:
+
+```text
+~/projects/Mutation_Patrol_Robot
+```
+
+## Troubleshooting
+
+### Browser Cannot Open the App
+
+Use this URL in Windows Chrome or Edge:
+
+```text
+http://localhost:8000
+```
+
+Do not use `http://0.0.0.0:8000` in the browser.
+
+### Conda Is Not Found
+
+Make sure conda is installed inside WSL, not only on Windows:
+
+```bash
+conda --version
+```
+
+If this fails, install Miniconda or Miniforge inside WSL and reopen the WSL
+terminal.
+
+### npm Package Error
+
+The conda package `nodejs` should provide `npm`. The launcher checks this and
+will try to install `nodejs` again if `npm` is missing.
+
+### Port 8000 Is Already in Use
+
+Stop the existing server process, or change the port in:
+
+```text
+scripts/run_app_wsl_conda.sh
+```
+
+### samtools/bcftools/minimap2 Missing
+
+Activate the environment and check:
+
+```bash
+conda activate mutation_patrol
+samtools --version
+bcftools --version
+minimap2 --version
+```
+
+If any command is missing, reinstall the environment packages:
+
+```bash
+conda install -n mutation_patrol -c conda-forge -c bioconda samtools bcftools minimap2
+```
