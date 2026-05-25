@@ -1,0 +1,11 @@
+{
+  "timestamp": "2026-05-22T14:25:31.292622",
+  "args": {
+    "ref_fasta": "./test_data/genome/GCF_000002765.6_GCA_000002765_genomic.fna",
+    "annotation": null,
+    "annotation_dir": "./test_data/3D7_jsonl/",
+    "out_dir": "./test_data/3D7_database/",
+    "genes": null,
+    "force": true
+  }
+}

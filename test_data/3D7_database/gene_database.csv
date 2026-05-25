@@ -1,0 +1,7 @@
+symbol,gene_id,description,chrom,resolved_chrom,strand,gene_start,gene_end,cds_length,aa_length,exon_count,sequence_status
+PF3D7_0417200,9221804,bifunctional dihydrofolate reductase-thymidylate synthase,NC_004318.2,NC_004318.2,+,748088,749914,1827,608,1,ok
+PF3D7_1343700,814205,kelch protein K13,NC_004331.3,NC_004331.3,-,1724817,1726997,2181,726,1,ok
+PF3D7_0523000,813045,multidrug resistance protein 1,NC_004326.2,NC_004326.2,+,957890,962149,4260,1419,1,ok
+PF3D7_0810800,2655294,hydroxymethyldihydropterin pyrophosphokinase-dihydropteroate synthase,NC_004329.3,NC_004329.3,+,548200,550616,2121,706,3,ok
+PF3D7_0709000,2655199,chloroquine resistance transporter,NC_004328.3,NC_004328.3,+,403222,406317,1275,424,13,ok
+PF3D7_0304600,814364,circumsporozoite (CS) protein,NC_000521.4,NC_000521.4,-,221323,222516,1194,397,1,ok
