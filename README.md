@@ -62,6 +62,8 @@ You can download it from:
 https://www.ncbi.nlm.nih.gov/datasets/gene/
 ```
 
+![Download NCBI product report JSONL](docs/download_jsonl_file.gif)
+
 Recommended download flow:
 
 1. Search for the AMR gene of interest on the NCBI Datasets Gene page.
