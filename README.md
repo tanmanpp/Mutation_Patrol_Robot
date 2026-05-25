@@ -108,9 +108,7 @@ bash scripts/run_frontend_wsl.sh
 The database builder expects an NCBI Datasets **Gene product report JSONL** file.
 You can download it from:
 
-```text
-https://www.ncbi.nlm.nih.gov/datasets/genome/
-```
+[https://www.ncbi.nlm.nih.gov/datasets/genome/](https://www.ncbi.nlm.nih.gov/datasets/genome/)
 
 ![Download NCBI product report JSONL](docs/download_jsonl_file.gif)
 
