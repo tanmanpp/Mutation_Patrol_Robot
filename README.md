@@ -9,6 +9,47 @@ now split into two API-friendly Python operations:
 The UI can later call these two operations separately instead of running one
 large, tightly coupled script.
 
+## Quick Start
+
+Recommended platform:
+
+```text
+Windows with WSL, Linux, or macOS with conda/bioconda
+```
+
+Native Windows Python is not recommended because the workflow calls Linux
+bioinformatics tools.
+
+For normal Windows + WSL use:
+
+1. Install WSL and conda inside WSL. See [WSL_SETUP.md](WSL_SETUP.md).
+2. Double-click:
+
+```text
+start_mutation_patrol_robot.bat
+```
+
+3. Open the web UI:
+
+```text
+http://localhost:8000
+```
+
+4. Build a gene database:
+   - Download NCBI Datasets Gene **Product report JSONL** files.
+   - Upload the reference FASTA.
+   - Upload one or more product report `.jsonl` files.
+
+5. Run sample analysis:
+   - Select the gene database.
+   - Upload exactly one FASTQ or BAM file.
+   - Run analysis.
+
+6. Inspect results:
+   - Review mutation candidates.
+   - Use Site Query for selected nucleotide or amino-acid positions.
+   - View depth and mutation frequency charts.
+
 ## Web UI
 
 The UI is scaffolded as a local web app:
