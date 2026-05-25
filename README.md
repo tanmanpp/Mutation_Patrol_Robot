@@ -22,30 +22,39 @@ bioinformatics tools.
 
 For normal Windows + WSL use:
 
-1. Install WSL and conda inside WSL. See [WSL_SETUP.md](WSL_SETUP.md).
-2. Double-click:
+1. Download the project from GitHub:
+
+```bash
+git clone https://github.com/tanmanpp/Mutation_Patrol_Robot.git
+```
+
+   Or open [tanmanpp/Mutation_Patrol_Robot](https://github.com/tanmanpp/Mutation_Patrol_Robot)
+   and choose **Code > Download ZIP**.
+
+2. Install WSL and conda inside WSL. See [WSL_SETUP.md](WSL_SETUP.md).
+3. Double-click:
 
 ```text
 start_mutation_patrol_robot.bat
 ```
 
-3. Open the web UI:
+4. Open the web UI:
 
 ```text
 http://localhost:8000
 ```
 
-4. Build a gene database:
+5. Build a gene database:
    - Download NCBI Datasets Gene **Product report JSONL** files.
    - Upload the reference FASTA.
    - Upload one or more product report `.jsonl` files.
 
-5. Run sample analysis:
+6. Run sample analysis:
    - Select the gene database.
    - Upload exactly one FASTQ or BAM file.
    - Run analysis.
 
-6. Inspect results:
+7. Inspect results:
    - Review mutation candidates.
    - Use Site Query for selected nucleotide or amino-acid positions.
    - View depth and mutation frequency charts.
