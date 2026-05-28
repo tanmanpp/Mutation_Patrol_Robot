@@ -232,6 +232,7 @@ pileups for non-reference alleles, and exports:
 - `tables/mutation_candidates.csv`
 - `tables/sample_summary.csv`
 - `tables/summary.json`
+- `final_report.html` when exported from the Results page or `export_result_html.py`
 - `analyze_sample.log`
 - `analyze_sample_metadata.json`
 
@@ -242,6 +243,23 @@ a database CDS exon. The older VCF-based path is still available with
 `--candidate_source vcf`, which writes `work/vcf/{gene}.vcf.gz`.
 `sample_summary.csv` includes one row per database gene and starts with the
 `Gene name` column for UI display.
+
+Export a final HTML report for one analysis output folder:
+
+```bash
+python export_result_html.py \
+  --out_dir app_data/results/sample_01
+```
+
+This writes:
+
+```text
+app_data/results/sample_01/final_report.html
+```
+
+The HTML report includes the analysis summary, mutation candidates, all site
+query tables, and simple depth/frequency charts. In the web UI, use
+**Results > Export HTML Report** for the selected result.
 
 ## Query User-Selected Sites
 

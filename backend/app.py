@@ -173,6 +173,17 @@ def result(run_id: str):
     return services.get_result(run_id)
 
 
+@app.get("/api/results/{run_id}/report")
+def result_html_report(run_id: str):
+    try:
+        report_path = services.generate_html_report(run_id)
+        return FileResponse(report_path, media_type="text/html", filename=report_path.name)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.get("/")
 def serve_ui_root():
     index_path = FRONTEND_DIST / "index.html"

@@ -9,6 +9,7 @@ from fastapi import UploadFile
 
 from modules.bam_allele_freq import mutation_candidates_from_bam
 from modules.gene_database import build_gene_database_from_annotations, load_gene_database
+from modules.html_report import render_html_report
 from modules.mapping import map_reads_to_ref
 from modules.report import write_tables
 from modules.roi_extract import extract_gene_bams
@@ -359,7 +360,15 @@ def get_result(run_id: str):
         "mutation_candidates": read_csv_records(tables / "mutation_candidates.csv", limit=500),
         "site_query": read_latest_site_query(result_dir),
         "site_queries": read_site_queries(result_dir),
+        "html_report": relative_path(result_dir / "final_report.html") if (result_dir / "final_report.html").exists() else "",
     }
+
+
+def generate_html_report(run_id: str):
+    result_dir = RESULTS_DIR / safe_name(run_id)
+    if not result_dir.exists():
+        raise FileNotFoundError(f"Result not found: {run_id}")
+    return render_html_report(result_dir)
 
 
 def read_latest_site_query(result_dir: Path):

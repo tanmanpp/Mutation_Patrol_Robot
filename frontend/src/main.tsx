@@ -40,6 +40,7 @@ type ResultPayload = {
   mutation_candidates: Record<string, string>[];
   site_query: Record<string, string>[];
   site_queries?: SiteQueryResult[];
+  html_report?: string;
 };
 
 type SiteQueryResult = {
@@ -557,6 +558,15 @@ function App() {
     pushStatus(`Result loaded: ${payload.run_id}`);
   }
 
+  function openHtmlReport() {
+    if (!result?.run_id) {
+      pushStatus("No result selected for HTML report.");
+      return;
+    }
+    window.open(`${API_BASE}/api/results/${encodeURIComponent(result.run_id)}/report`, "_blank");
+    pushStatus(`HTML report requested: ${result.run_id}`);
+  }
+
   async function refreshUploadStats() {
     const response = await fetch(`${API_BASE}/api/uploads/samples`);
     const payload = await response.json();
@@ -757,6 +767,9 @@ function App() {
                   if (latest) loadResult(latest.run_id);
                 }}>
                   Load Latest
+                </button>
+                <button type="button" onClick={openHtmlReport} disabled={!result?.run_id}>
+                  Export HTML Report
                 </button>
               </div>
             </div>
