@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 
 import csv
+import json
 import re
-import subprocess
 from pathlib import Path
 from collections.abc import Iterable
 
-from modules.annotate_mut import FIELDNAMES, annotate_candidate_row
+from modules.annotate_mut import AA_NAMES, FIELDNAMES, annotate_candidate_row
 from modules.bam_allele_freq import BASES, _count_pileup_events, _run_mpileup, ensure_bam_index
 from modules.gene_database import (
     cds_index_to_genomic_pos,
@@ -14,10 +14,128 @@ from modules.gene_database import (
     reverse_complement,
     translate_dna,
 )
-from modules.utils import ensure_dir, resolve_project_path
+from modules.utils import ensure_dir, resolve_project_path, run_cmd
 
 
 CIGAR_RE = re.compile(r"(\d+)([MIDNSHP=X])")
+
+NO_CALL_REGION_FIELDS = [
+    "gene", "chrom", "start", "end", "length", "reason",
+    "mean_depth", "max_depth", "minimum_call_depth",
+]
+
+
+def _optional_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _biological_position_sort_key(row: dict):
+    """Sort coding results from the protein N-terminus to C-terminus."""
+    aa_pos = _optional_int(row.get("aa_pos"))
+    cds_pos = _optional_int(row.get("cds_pos"))
+    genomic_pos = _optional_int(row.get("pos"))
+    if aa_pos is not None:
+        return (
+            str(row.get("gene") or row.get("Gene symbol") or ""),
+            0,
+            aa_pos,
+            cds_pos if cds_pos is not None else float("inf"),
+            genomic_pos if genomic_pos is not None else float("inf"),
+            str(row.get("alt") or row.get("alt_codon") or ""),
+        )
+    return (
+        str(row.get("gene") or row.get("Gene symbol") or ""),
+        1,
+        genomic_pos if genomic_pos is not None else float("inf"),
+        float("inf"),
+        float("inf"),
+        str(row.get("alt") or row.get("alt_codon") or ""),
+    )
+
+
+def _site_filter(depth: int, min_depth: int):
+    if depth == 0:
+        return "NO_MAPPING"
+    if depth < min_depth:
+        return "LOW_DEPTH"
+    return "PASS"
+
+
+def _qualifying_alleles(counts: dict[str, int],
+                        depth: int,
+                        min_allele_count: int,
+                        min_allele_freq: float):
+    if depth <= 0:
+        return []
+    return [
+        allele
+        for allele, count in counts.items()
+        if count >= min_allele_count and count / depth >= min_allele_freq
+    ]
+
+
+def _site_call_status(depth: int,
+                      min_depth: int,
+                      counts: dict[str, int],
+                      ref: str,
+                      min_allele_count: int,
+                      min_allele_freq: float):
+    if depth < min_depth:
+        return "NO_CALL"
+    qualifying = _qualifying_alleles(
+        counts, depth, min_allele_count, min_allele_freq
+    )
+    if len(qualifying) >= 2:
+        return "MIXED_SIGNAL"
+    dominant = max(counts, key=counts.get) if counts else ""
+    if dominant == ref:
+        return "REFERENCE"
+    return "VARIANT"
+
+
+def _allele_status(depth: int, min_depth: int, allele_depth: int):
+    if depth < min_depth:
+        return "NO_CALL"
+    return "OBSERVED" if allele_depth > 0 else "NOT_OBSERVED"
+
+
+def _allele_spectrum(counts: dict[str, int], depth: int):
+    if depth <= 0:
+        return ""
+    observed = [
+        (allele, count)
+        for allele, count in counts.items()
+        if count > 0
+    ]
+    observed.sort(key=lambda item: (-item[1], item[0]))
+    return "; ".join(
+        f"{allele}:{count} ({count / depth:.1%})"
+        for allele, count in observed
+    )
+
+
+def _site_qc_flags(depth: int,
+                   min_depth: int,
+                   call_status: str,
+                   allele_depth: int | None = None,
+                   min_allele_count: int = 1):
+    flags = []
+    if depth == 0:
+        flags.append("NO_MAPPING")
+    elif depth < min_depth:
+        flags.append("LOW_DEPTH")
+    if call_status == "MIXED_SIGNAL":
+        flags.append("MULTIPLE_ALLELES")
+    if (
+        allele_depth is not None
+        and 0 < allele_depth < min_allele_count
+        and depth >= min_depth
+    ):
+        flags.append("LOW_ALLELE_SUPPORT")
+    return ";".join(flags) or "PASS"
 
 
 def _resolve_query_positions(gene_record: dict,
@@ -158,18 +276,16 @@ def _run_samtools_view(bam_path: Path,
                        min_mapq: int,
                        logger):
     region = f"{chrom}:{start}-{end}"
-    cmd = [
-        "bash", "-lc",
-        f"samtools view -q {min_mapq} -F 2308 {bam_path} {region}"
-    ]
-    logger.info(f"CMD: {' '.join(map(str, cmd))}")
     try:
-        completed = subprocess.run(cmd, check=True, capture_output=True, text=True)
-    except subprocess.CalledProcessError as exc:
-        if exc.stdout:
-            logger.error(exc.stdout.strip())
-        if exc.stderr:
-            logger.error(exc.stderr.strip())
+        completed = run_cmd(
+            [
+                "samtools", "view", "-q", str(min_mapq), "-F", "2308",
+                str(bam_path), region,
+            ],
+            logger=logger,
+            capture_output=True,
+        )
+    except Exception as exc:
         raise RuntimeError(
             "samtools view failed. Check that the BAM has an index and the queried contig exists in the BAM."
         ) from exc
@@ -211,14 +327,19 @@ def _read_bases_at_positions(sam_line: str, target_positions: set[int]):
     return bases
 
 
-def _read_events_at_positions(sam_line: str, target_positions: set[int]):
+def _read_events_at_positions(sam_line: str,
+                              target_positions: set[int],
+                              min_baseq: int = 20):
     parts = sam_line.rstrip("\n").split("\t")
     if len(parts) < 11:
-        return {"bases": {}, "insertions": {}}
+        return {"bases": {}, "insertions": {}, "strand": "unknown"}
 
+    flag = int(parts[1])
     ref_pos = int(parts[3])
     cigar = parts[5]
     sequence = parts[9].upper()
+    qualities = parts[10]
+    strand = "reverse" if flag & 16 else "forward"
     read_pos = 0
     bases = {}
     insertions = {}
@@ -230,14 +351,25 @@ def _read_events_at_positions(sam_line: str, target_positions: set[int]):
                 current_ref_pos = ref_pos + offset
                 if current_ref_pos in target_positions:
                     base_index = read_pos + offset
-                    if base_index < len(sequence):
+                    base_quality = (
+                        ord(qualities[base_index]) - 33
+                        if base_index < len(qualities) and qualities != "*"
+                        else 0
+                    )
+                    if base_index < len(sequence) and base_quality >= min_baseq:
                         bases[current_ref_pos] = sequence[base_index]
             ref_pos += length
             read_pos += length
         elif op == "I":
             anchor_pos = ref_pos - 1
             inserted_sequence = sequence[read_pos:read_pos + length]
-            if anchor_pos in target_positions and inserted_sequence:
+            inserted_qualities = qualities[read_pos:read_pos + length]
+            quality_ok = (
+                qualities != "*"
+                and len(inserted_qualities) == length
+                and all(ord(value) - 33 >= min_baseq for value in inserted_qualities)
+            )
+            if anchor_pos in target_positions and inserted_sequence and quality_ok:
                 insertions.setdefault(anchor_pos, []).append(inserted_sequence)
             read_pos += length
         elif op == "S":
@@ -247,7 +379,7 @@ def _read_events_at_positions(sam_line: str, target_positions: set[int]):
         elif op in ("H", "P"):
             continue
 
-    return {"bases": bases, "insertions": insertions}
+    return {"bases": bases, "insertions": insertions, "strand": strand}
 
 
 def _coding_base_from_genomic_base(base: str, strand: str):
@@ -262,20 +394,25 @@ def _codon_rows_for_aa_queries(gene: str,
                                codon_queries: list[dict],
                                sam_lines: list[str],
                                requested_alt: str | None,
-                               min_alt_freq: float):
+                               min_alt_freq: float,
+                               min_depth: int,
+                               min_mapq: int,
+                               min_baseq: int,
+                               min_allele_count: int):
     target_positions = {
         pos
         for query in codon_queries
         for pos in query["genomic_positions"]
     }
     read_events = [
-        _read_events_at_positions(line, target_positions)
+        _read_events_at_positions(line, target_positions, min_baseq)
         for line in sam_lines
     ]
     rows = []
 
     for query in codon_queries:
         codon_counts = {}
+        codon_strand_counts = {}
         insertion_counts = {}
         for read_event in read_events:
             position_bases = read_event["bases"]
@@ -287,6 +424,10 @@ def _codon_rows_for_aa_queries(gene: str,
             )
             if set(codon).issubset(set(BASES)):
                 codon_counts[codon] = codon_counts.get(codon, 0) + 1
+                strands = codon_strand_counts.setdefault(
+                    codon, {"forward": 0, "reverse": 0}
+                )
+                strands[read_event["strand"]] += 1
 
             for anchor_pos in query["genomic_positions"]:
                 for inserted_sequence in read_event["insertions"].get(anchor_pos, []):
@@ -297,6 +438,16 @@ def _codon_rows_for_aa_queries(gene: str,
         depth = sum(codon_counts.values())
         ref_codon = query["ref_codon"]
         ref_depth = codon_counts.get(ref_codon, 0)
+        call_status = _site_call_status(
+            depth,
+            min_depth,
+            codon_counts,
+            ref_codon,
+            min_allele_count,
+            min_alt_freq,
+        )
+        spectrum = _allele_spectrum(codon_counts, depth)
+        allele_count = sum(1 for count in codon_counts.values() if count > 0)
 
         if requested_alt:
             requested = requested_alt.upper()
@@ -317,7 +468,7 @@ def _codon_rows_for_aa_queries(gene: str,
                 if codon == ref_codon:
                     continue
                 allele_freq = count / depth if depth else 0
-                if allele_freq >= min_alt_freq:
+                if count >= min_allele_count and allele_freq >= min_alt_freq:
                     codons.append(codon)
 
         pos_label = "-".join(str(pos) for pos in query["genomic_positions"])
@@ -333,11 +484,30 @@ def _codon_rows_for_aa_queries(gene: str,
 
             note = f"site_query:aa_pos={aa_pos}; codon-spanning reads only"
             if depth == 0:
-                note += "; no reads mapped across requested codon"
+                note += "; no reads mapped across requested codon; unable to determine"
+            elif depth < min_depth:
+                note += f"; depth below minimum {min_depth}; unable to determine"
             elif codon == ref_codon:
                 note += "; reference codon"
             elif alt_depth == 0:
                 note += "; requested codon/amino acid not observed"
+
+            if call_status == "NO_CALL":
+                aa_change = "無法判斷"
+                effect = "no_call"
+            elif codon == ref_codon:
+                effect = "reference"
+            elif ref_aa == alt_aa:
+                effect = "synonymous"
+            elif alt_aa == "*":
+                effect = "stop_gained"
+            elif ref_aa == "*":
+                effect = "stop_lost"
+            else:
+                effect = "missense"
+            strand_counts = codon_strand_counts.get(
+                codon, {"forward": 0, "reverse": 0}
+            )
 
             rows.append({
                 "Gene name": gene_record.get("description") or gene,
@@ -348,20 +518,43 @@ def _codon_rows_for_aa_queries(gene: str,
                 "ref": ref_codon,
                 "alt": codon,
                 "qual": "",
-                "filter": "PASS" if depth else "NO_MAPPING",
+                "filter": _site_filter(depth, min_depth),
                 "depth": depth,
+                "raw_depth": depth,
                 "ref_depth": ref_depth,
                 "alt_depth": alt_depth,
+                "forward_depth": strand_counts["forward"],
+                "reverse_depth": strand_counts["reverse"],
                 "allele_freq": f"{allele_freq:.6f}",
-                "variant_type": "REF" if codon == ref_codon else "CODON",
+                "allele_count": allele_count,
+                "allele_spectrum": spectrum,
+                "call_status": call_status,
+                "allele_status": _allele_status(depth, min_depth, alt_depth),
+                "qc_flags": _site_qc_flags(
+                    depth, min_depth, call_status, alt_depth, min_allele_count
+                ),
+                "min_depth": min_depth,
+                "min_mapq": min_mapq,
+                "min_baseq": min_baseq,
+                "min_allele_count": min_allele_count,
+                "variant_type": (
+                    "NO_CALL"
+                    if call_status == "NO_CALL"
+                    else ("REF" if codon == ref_codon else "CODON")
+                ),
+                "region_type": "CDS",
+                "effect": effect,
                 "source": "bam_codon_site_query",
                 "cds_pos": query["cds_start"],
                 "codon_pos": "1-3",
                 "ref_codon": ref_codon,
                 "alt_codon": codon,
+                "codon_change": f"{ref_codon}>{codon}",
                 "aa_pos": aa_pos,
                 "ref_aa": ref_aa,
+                "ref_aa_name": AA_NAMES.get(ref_aa, "Unknown"),
                 "alt_aa": alt_aa,
+                "alt_aa_name": AA_NAMES.get(alt_aa, "Unknown"),
                 "aa_change": aa_change,
                 "note": note,
             })
@@ -373,7 +566,11 @@ def _codon_rows_for_aa_queries(gene: str,
         else:
             requested_insertions = [
                 sequence for sequence, count in sorted(insertion_counts.items())
-                if depth and count / depth >= min_alt_freq
+                if (
+                    depth
+                    and count >= min_allele_count
+                    and count / depth >= min_alt_freq
+                )
             ]
 
         for inserted_sequence in requested_insertions:
@@ -386,14 +583,34 @@ def _codon_rows_for_aa_queries(gene: str,
                 aa_change = f"{query['ref_aa']}{query['aa_pos']}_ins{inserted_aa}"
                 alt_aa = inserted_aa
                 note = f"site_query:aa_pos={query['aa_pos']}; codon-spanning reads only; in-frame insertion"
+                effect = "inframe_insertion"
             else:
                 aa_change = f"{query['ref_aa']}{query['aa_pos']}fs"
                 alt_aa = "frameshift"
                 note = f"site_query:aa_pos={query['aa_pos']}; codon-spanning reads only; frameshift insertion"
+                effect = "frameshift"
             if depth == 0:
-                note += "; no reads mapped across requested codon"
+                note += "; no reads mapped across requested codon; unable to determine"
+            elif depth < min_depth:
+                note += f"; depth below minimum {min_depth}; unable to determine"
             elif alt_depth == 0:
                 note += "; requested insertion not observed"
+
+            insertion_counts_for_call = {
+                ref_codon: max(depth - alt_depth, 0),
+                f"+{inserted_sequence}": alt_depth,
+            }
+            insertion_call_status = _site_call_status(
+                depth,
+                min_depth,
+                insertion_counts_for_call,
+                ref_codon,
+                min_allele_count,
+                min_alt_freq,
+            )
+            if insertion_call_status == "NO_CALL":
+                aa_change = "無法判斷"
+                effect = "no_call"
 
             rows.append({
                 "Gene name": gene_record.get("description") or gene,
@@ -404,20 +621,51 @@ def _codon_rows_for_aa_queries(gene: str,
                 "ref": ref_codon,
                 "alt": f"{ref_codon}+{inserted_sequence}",
                 "qual": "",
-                "filter": "PASS" if depth else "NO_MAPPING",
+                "filter": _site_filter(depth, min_depth),
                 "depth": depth,
+                "raw_depth": depth,
                 "ref_depth": ref_depth,
                 "alt_depth": alt_depth,
+                "forward_depth": "",
+                "reverse_depth": "",
                 "allele_freq": f"{allele_freq:.6f}",
-                "variant_type": "INS",
+                "allele_count": allele_count,
+                "allele_spectrum": spectrum,
+                "call_status": insertion_call_status,
+                "allele_status": _allele_status(depth, min_depth, alt_depth),
+                "qc_flags": _site_qc_flags(
+                    depth,
+                    min_depth,
+                    insertion_call_status,
+                    alt_depth,
+                    min_allele_count,
+                ),
+                "min_depth": min_depth,
+                "min_mapq": min_mapq,
+                "min_baseq": min_baseq,
+                "min_allele_count": min_allele_count,
+                "variant_type": (
+                    "NO_CALL" if insertion_call_status == "NO_CALL" else "INS"
+                ),
+                "region_type": "CDS",
+                "effect": effect,
                 "source": "bam_codon_site_query",
                 "cds_pos": query["cds_start"],
                 "codon_pos": "1-3",
                 "ref_codon": ref_codon,
                 "alt_codon": f"{ref_codon}+{inserted_sequence}",
+                "codon_change": f"{ref_codon}>{ref_codon}+{inserted_sequence}",
                 "aa_pos": query["aa_pos"],
                 "ref_aa": query["ref_aa"],
+                "ref_aa_name": AA_NAMES.get(query["ref_aa"], "Unknown"),
                 "alt_aa": alt_aa,
+                "alt_aa_name": (
+                    ", ".join(
+                        AA_NAMES.get(value, "Unknown") for value in alt_aa
+                    )
+                    if effect == "inframe_insertion"
+                    else ("Frameshift" if effect == "frameshift" else "")
+                ),
                 "aa_change": aa_change,
                 "note": note,
             })
@@ -434,28 +682,93 @@ def _pileup_line_by_position(lines):
     return by_pos
 
 
+def _compress_no_call_regions(gene: str,
+                              chrom: str,
+                              positions: list[tuple[int, int, str]],
+                              min_depth: int):
+    if not positions:
+        return []
+    regions = []
+    current = None
+    for pos, depth, reason in positions:
+        if (
+            current
+            and pos == current["end"] + 1
+            and reason == current["reason"]
+        ):
+            current["end"] = pos
+            current["depths"].append(depth)
+            continue
+        if current:
+            regions.append(current)
+        current = {
+            "gene": gene,
+            "chrom": chrom,
+            "start": pos,
+            "end": pos,
+            "reason": reason,
+            "depths": [depth],
+        }
+    if current:
+        regions.append(current)
+
+    output = []
+    for region in regions:
+        depths = region.pop("depths")
+        output.append({
+            **region,
+            "length": region["end"] - region["start"] + 1,
+            "mean_depth": f"{sum(depths) / len(depths):.2f}",
+            "max_depth": max(depths),
+            "minimum_call_depth": min_depth,
+        })
+    return output
+
+
 def _rows_for_site(gene: str,
                    gene_record: dict,
                    gene_db: dict,
                    query: dict,
                    pileup_parts,
                    requested_alt: str | None,
-                   min_alt_freq: float):
+                   min_alt_freq: float,
+                   min_depth: int,
+                   min_mapq: int,
+                   min_baseq: int,
+                   min_allele_count: int):
     if pileup_parts:
         chrom, pos, ref_base, raw_depth, read_bases = pileup_parts[:5]
         events = _count_pileup_events(read_bases, ref_base)
         counts = events["bases"]
+        strand_counts = events["strand_counts"]
         insertions = events["insertions"]
+        deletions = events["deletions"]
     else:
         chrom = query["chrom"]
         pos = str(query["pos"])
         ref_base = ""
+        raw_depth = "0"
         counts = {base: 0 for base in BASES}
+        strand_counts = {
+            base: {"forward": 0, "reverse": 0}
+            for base in BASES
+        }
         insertions = {}
+        deletions = {}
 
     ref = ref_base.upper()
     depth = sum(counts.values())
     ref_depth = counts.get(ref, 0) if ref else 0
+    call_status = _site_call_status(
+        depth,
+        min_depth,
+        counts,
+        ref,
+        min_allele_count,
+        min_alt_freq,
+    )
+    spectrum = _allele_spectrum(counts, depth)
+    allele_count = sum(1 for count in counts.values() if count > 0)
 
     requested_alt = requested_alt.upper() if requested_alt else None
     if requested_alt:
@@ -465,7 +778,13 @@ def _rows_for_site(gene: str,
         for base in BASES:
             allele_depth = counts[base]
             allele_freq = allele_depth / depth if depth else 0
-            if base == ref or allele_freq >= min_alt_freq:
+            if (
+                base == ref
+                or (
+                    allele_depth >= min_allele_count
+                    and allele_freq >= min_alt_freq
+                )
+            ):
                 if allele_depth > 0:
                     observed.append(base)
         alleles = observed or ([ref] if ref else [])
@@ -483,12 +802,17 @@ def _rows_for_site(gene: str,
         variant_type = "REF" if allele == ref else "SNV"
         note = f"site_query:{query['query_type']}={query['query_label']}"
         if depth == 0:
-            note += "; no reads mapped at requested site"
+            note += "; no reads mapped at requested site; unable to determine"
+        elif depth < min_depth:
+            note += f"; depth below minimum {min_depth}; unable to determine"
         elif allele == ref:
             note += "; reference allele"
         elif allele_depth == 0:
             note += "; requested allele not observed"
 
+        allele_strands = strand_counts.get(
+            allele, {"forward": 0, "reverse": 0}
+        )
         row = {
             "Gene name": gene_record.get("description") or gene,
             "Gene symbol": gene,
@@ -498,12 +822,26 @@ def _rows_for_site(gene: str,
             "ref": ref,
             "alt": allele,
             "qual": "",
-            "filter": "PASS" if depth else "NO_MAPPING",
+            "filter": _site_filter(depth, min_depth),
             "depth": depth,
+            "raw_depth": raw_depth,
             "ref_depth": ref_depth,
             "alt_depth": allele_depth,
+            "forward_depth": allele_strands["forward"],
+            "reverse_depth": allele_strands["reverse"],
             "allele_freq": f"{allele_freq:.6f}",
-            "variant_type": variant_type,
+            "allele_count": allele_count,
+            "allele_spectrum": spectrum,
+            "call_status": call_status,
+            "allele_status": _allele_status(depth, min_depth, allele_depth),
+            "qc_flags": _site_qc_flags(
+                depth, min_depth, call_status, allele_depth, min_allele_count
+            ),
+            "min_depth": min_depth,
+            "min_mapq": min_mapq,
+            "min_baseq": min_baseq,
+            "min_allele_count": min_allele_count,
+            "variant_type": "NO_CALL" if call_status == "NO_CALL" else variant_type,
             "source": "bam_site_query",
             "note": note,
         }
@@ -516,7 +854,11 @@ def _rows_for_site(gene: str,
     elif not requested_alt:
         insertion_alleles = [
             sequence for sequence, count in sorted(insertions.items())
-            if depth and count / depth >= min_alt_freq
+            if (
+                depth
+                and count >= min_allele_count
+                and count / depth >= min_alt_freq
+            )
         ]
 
     for inserted_sequence in insertion_alleles:
@@ -526,10 +868,24 @@ def _rows_for_site(gene: str,
         allele_freq = allele_depth / depth if depth else 0
         note = f"site_query:{query['query_type']}={query['query_label']}; insertion_sequence={inserted_sequence}"
         if depth == 0:
-            note += "; no reads mapped at requested site"
+            note += "; no reads mapped at requested site; unable to determine"
+        elif depth < min_depth:
+            note += f"; depth below minimum {min_depth}; unable to determine"
         elif allele_depth == 0:
             note += "; requested insertion not observed"
 
+        insertion_counts_for_call = {
+            ref: max(depth - allele_depth, 0),
+            f"+{inserted_sequence}": allele_depth,
+        }
+        insertion_call_status = _site_call_status(
+            depth,
+            min_depth,
+            insertion_counts_for_call,
+            ref,
+            min_allele_count,
+            min_alt_freq,
+        )
         row = {
             "Gene name": gene_record.get("description") or gene,
             "Gene symbol": gene,
@@ -539,17 +895,306 @@ def _rows_for_site(gene: str,
             "ref": ref,
             "alt": f"{ref}{inserted_sequence}" if ref else inserted_sequence,
             "qual": "",
-            "filter": "PASS" if depth else "NO_MAPPING",
+            "filter": _site_filter(depth, min_depth),
             "depth": depth,
+            "raw_depth": raw_depth,
             "ref_depth": ref_depth,
             "alt_depth": allele_depth,
+            "forward_depth": "",
+            "reverse_depth": "",
             "allele_freq": f"{allele_freq:.6f}",
-            "variant_type": "INS",
+            "allele_count": allele_count,
+            "allele_spectrum": spectrum,
+            "call_status": insertion_call_status,
+            "allele_status": _allele_status(depth, min_depth, allele_depth),
+            "qc_flags": _site_qc_flags(
+                depth,
+                min_depth,
+                insertion_call_status,
+                allele_depth,
+                min_allele_count,
+            ),
+            "min_depth": min_depth,
+            "min_mapq": min_mapq,
+            "min_baseq": min_baseq,
+            "min_allele_count": min_allele_count,
+            "variant_type": (
+                "NO_CALL" if insertion_call_status == "NO_CALL" else "INS"
+            ),
+            "source": "bam_site_query",
+            "note": note,
+        }
+        rows.append(annotate_candidate_row(row, gene_db))
+
+    if not requested_alt:
+        deletion_alleles = [
+            sequence for sequence, count in sorted(deletions.items())
+            if (
+                depth
+                and count >= min_allele_count
+                and count / depth >= min_alt_freq
+            )
+        ]
+    else:
+        deletion_alleles = []
+
+    for deleted_sequence in deletion_alleles:
+        allele_depth = deletions.get(deleted_sequence, 0)
+        allele_freq = allele_depth / depth if depth else 0
+        deletion_label = f"-{deleted_sequence}"
+        deletion_counts_for_call = {
+            ref: max(depth - allele_depth, 0),
+            deletion_label: allele_depth,
+        }
+        deletion_call_status = _site_call_status(
+            depth,
+            min_depth,
+            deletion_counts_for_call,
+            ref,
+            min_allele_count,
+            min_alt_freq,
+        )
+        note = (
+            f"site_query:{query['query_type']}={query['query_label']}; "
+            f"deletion_sequence={deleted_sequence}"
+        )
+        row = {
+            "Gene name": gene_record.get("description") or gene,
+            "Gene symbol": gene,
+            "gene": gene,
+            "chrom": chrom,
+            "pos": pos,
+            "ref": f"{ref}{deleted_sequence}" if ref else deleted_sequence,
+            "alt": ref,
+            "qual": "",
+            "filter": _site_filter(depth, min_depth),
+            "depth": depth,
+            "raw_depth": raw_depth,
+            "ref_depth": ref_depth,
+            "alt_depth": allele_depth,
+            "forward_depth": "",
+            "reverse_depth": "",
+            "allele_freq": f"{allele_freq:.6f}",
+            "allele_count": sum(
+                count > 0 for count in deletion_counts_for_call.values()
+            ),
+            "allele_spectrum": _allele_spectrum(
+                deletion_counts_for_call, depth
+            ),
+            "call_status": deletion_call_status,
+            "allele_status": _allele_status(depth, min_depth, allele_depth),
+            "qc_flags": _site_qc_flags(
+                depth,
+                min_depth,
+                deletion_call_status,
+                allele_depth,
+                min_allele_count,
+            ),
+            "min_depth": min_depth,
+            "min_mapq": min_mapq,
+            "min_baseq": min_baseq,
+            "min_allele_count": min_allele_count,
+            "variant_type": (
+                "NO_CALL" if deletion_call_status == "NO_CALL" else "DEL"
+            ),
             "source": "bam_site_query",
             "note": note,
         }
         rows.append(annotate_candidate_row(row, gene_db))
     return rows
+
+
+def scan_bam_gene_region(gene_db_path: Path,
+                         bam_path: Path,
+                         out_csv: Path,
+                         gene: str,
+                         ref_fasta: Path | None,
+                         min_mapq: int,
+                         min_alt_freq: float,
+                         min_depth: int,
+                         min_baseq: int,
+                         min_allele_count: int,
+                         force: bool,
+                         logger):
+    summary_path = out_csv.parent / "scan_summary.json"
+    no_call_csv = out_csv.parent / "no_call_regions.csv"
+    complete_table_csv = out_csv.parent / "complete_gene_table.csv"
+    if (
+        out_csv.exists()
+        and summary_path.exists()
+        and no_call_csv.exists()
+        and complete_table_csv.exists()
+        and not force
+    ):
+        logger.info(f"Whole-gene scan exists, skip: {out_csv}")
+        return {
+            "table": out_csv,
+            "summary": summary_path,
+            "no_call_regions": no_call_csv,
+            "complete_table": complete_table_csv,
+        }
+
+    gene_db = load_gene_database(gene_db_path)
+    gene_record = gene_db.get("genes_by_symbol", {}).get(gene)
+    if not gene_record:
+        raise ValueError(f"Gene not found in database: {gene}")
+    if not bam_path.exists():
+        raise FileNotFoundError(f"BAM not found: {bam_path}")
+    ensure_bam_index(bam_path, logger)
+
+    if ref_fasta is None:
+        ref_fasta = resolve_project_path(gene_db["reference_fasta"])
+    if not ref_fasta.exists():
+        raise FileNotFoundError(f"Reference FASTA not found: {ref_fasta}")
+
+    chrom = gene_record.get("resolved_chrom") or gene_record["chrom"]
+    start = int(gene_record["gene_start"])
+    end = int(gene_record["gene_end"])
+    lines = _run_mpileup(
+        bam_path=bam_path,
+        ref_fasta=ref_fasta,
+        chrom=chrom,
+        start=start,
+        end=end,
+        min_mapq=min_mapq,
+        logger=logger,
+        min_baseq=min_baseq,
+    )
+    pileup_by_pos = _pileup_line_by_position(lines)
+
+    variant_rows = []
+    complete_rows = []
+    no_call_positions = []
+    callable_positions = 0
+    reference_positions = 0
+    mixed_positions = set()
+    variant_positions = set()
+    variant_type_counts = {}
+
+    for pos in range(start, end + 1):
+        query = {
+            "chrom": chrom,
+            "pos": pos,
+            "query_type": "gene_region",
+            "query_label": f"{start}-{end}",
+        }
+        rows = _rows_for_site(
+            gene=gene,
+            gene_record=gene_record,
+            gene_db=gene_db,
+            query=query,
+            pileup_parts=pileup_by_pos.get(pos),
+            requested_alt=None,
+            min_alt_freq=min_alt_freq,
+            min_depth=min_depth,
+            min_mapq=min_mapq,
+            min_baseq=min_baseq,
+            min_allele_count=min_allele_count,
+        )
+        first_row = rows[0] if rows else {}
+        complete_rows.extend(rows)
+        depth = int(first_row.get("depth") or 0)
+        call_status = first_row.get("call_status") or "NO_CALL"
+        if call_status == "NO_CALL":
+            no_call_positions.append(
+                (pos, depth, _site_filter(depth, min_depth))
+            )
+            continue
+
+        callable_positions += 1
+        if call_status == "MIXED_SIGNAL":
+            mixed_positions.add(pos)
+
+        significant_rows = [
+            row
+            for row in rows
+            if row.get("variant_type") not in {"", "REF", "NO_CALL"}
+            and row.get("allele_status") == "OBSERVED"
+            and int(row.get("alt_depth") or 0) >= min_allele_count
+            and float(row.get("allele_freq") or 0) >= min_alt_freq
+        ]
+        if not significant_rows:
+            reference_positions += 1
+            continue
+
+        variant_positions.add(pos)
+        variant_rows.extend(significant_rows)
+        for row in significant_rows:
+            variant_type = row.get("variant_type") or "OTHER"
+            variant_type_counts[variant_type] = (
+                variant_type_counts.get(variant_type, 0) + 1
+            )
+
+    no_call_regions = _compress_no_call_regions(
+        gene, chrom, no_call_positions, min_depth
+    )
+    gene_length = end - start + 1
+    summary = {
+        "scan_type": "whole_gene",
+        "gene": gene,
+        "gene_name": gene_record.get("description") or gene,
+        "chrom": chrom,
+        "start": start,
+        "end": end,
+        "gene_length": gene_length,
+        "callable_positions": callable_positions,
+        "callable_percent": (
+            round(callable_positions / gene_length * 100, 2)
+            if gene_length else 0
+        ),
+        "no_call_positions": len(no_call_positions),
+        "no_call_regions": len(no_call_regions),
+        "reference_only_positions": reference_positions,
+        "variant_sites": len(variant_positions),
+        "variant_rows": len(variant_rows),
+        "complete_table_rows": len(complete_rows),
+        "mixed_signal_sites": len(mixed_positions),
+        "variant_type_counts": variant_type_counts,
+        "thresholds": {
+            "min_depth": min_depth,
+            "min_mapq": min_mapq,
+            "min_baseq": min_baseq,
+            "min_allele_count": min_allele_count,
+            "min_alt_freq": min_alt_freq,
+        },
+        "interpretation": (
+            "MIXED_SIGNAL reports multiple supported alleles only; "
+            "it does not diagnose mixed infection."
+        ),
+    }
+
+    ensure_dir(out_csv.parent)
+    variant_rows.sort(key=_biological_position_sort_key)
+    with open(out_csv, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(variant_rows)
+    with open(no_call_csv, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle, fieldnames=NO_CALL_REGION_FIELDS
+        )
+        writer.writeheader()
+        writer.writerows(no_call_regions)
+    with open(
+        complete_table_csv, "w", newline="", encoding="utf-8"
+    ) as handle:
+        writer = csv.DictWriter(handle, fieldnames=FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(complete_rows)
+    summary_path.write_text(
+        json.dumps(summary, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    logger.info(
+        f"Whole-gene scan wrote {len(variant_rows)} variant rows, "
+        f"{len(no_call_regions)} NO_CALL regions: {out_csv}"
+    )
+    return {
+        "table": out_csv,
+        "summary": summary_path,
+        "no_call_regions": no_call_csv,
+        "complete_table": complete_table_csv,
+    }
 
 
 def query_bam_sites(gene_db_path: Path,
@@ -563,6 +1208,9 @@ def query_bam_sites(gene_db_path: Path,
                    ref_fasta: Path | None,
                    min_mapq: int,
                    min_alt_freq: float,
+                   min_depth: int,
+                   min_baseq: int,
+                   min_allele_count: int,
                    force: bool,
                    logger):
     if out_csv.exists() and not force:
@@ -613,6 +1261,10 @@ def query_bam_sites(gene_db_path: Path,
             sam_lines=sam_lines,
             requested_alt=alt,
             min_alt_freq=min_alt_freq,
+            min_depth=min_depth,
+            min_mapq=min_mapq,
+            min_baseq=min_baseq,
+            min_allele_count=min_allele_count,
         )
     else:
         queries = _resolve_many_query_positions(gene_record, genomic_pos, cds_pos, aa_pos)
@@ -627,6 +1279,7 @@ def query_bam_sites(gene_db_path: Path,
             end=end,
             min_mapq=min_mapq,
             logger=logger,
+            min_baseq=min_baseq,
         )
         pileup_by_pos = _pileup_line_by_position(lines)
 
@@ -640,9 +1293,14 @@ def query_bam_sites(gene_db_path: Path,
                 pileup_parts=pileup_by_pos.get(query["pos"]),
                 requested_alt=alt,
                 min_alt_freq=min_alt_freq,
+                min_depth=min_depth,
+                min_mapq=min_mapq,
+                min_baseq=min_baseq,
+                min_allele_count=min_allele_count,
             ))
 
     ensure_dir(out_csv.parent)
+    rows.sort(key=_biological_position_sort_key)
     with open(out_csv, "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=FIELDNAMES)
         writer.writeheader()

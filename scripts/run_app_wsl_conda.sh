@@ -1,66 +1,38 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ENV_NAME="${MPR_CONDA_ENV:-mutation_patrol}"
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-
-load_conda() {
-  if command -v conda >/dev/null 2>&1; then
-    return 0
-  fi
-
-  for conda_profile in \
-    "$HOME/miniconda3/etc/profile.d/conda.sh" \
-    "$HOME/anaconda3/etc/profile.d/conda.sh" \
-    "$HOME/miniforge3/etc/profile.d/conda.sh" \
-    "$HOME/mambaforge/etc/profile.d/conda.sh"
-  do
-    if [[ -f "$conda_profile" ]]; then
-      # shellcheck disable=SC1090
-      source "$conda_profile"
-      return 0
-    fi
-  done
-
-  return 1
-}
-
-if ! load_conda; then
-  echo "Conda was not found in WSL."
-  echo "Install Miniconda/Miniforge in WSL first, then run this script again."
-  echo "Example: https://docs.conda.io/projects/miniconda/"
-  exit 1
-fi
-
-if ! conda env list | awk '{print $1}' | grep -qx "$ENV_NAME"; then
-  echo "Creating conda environment: $ENV_NAME"
-  conda create -y -n "$ENV_NAME" \
-    -c conda-forge -c bioconda \
-    python=3.11 pip nodejs samtools bcftools minimap2
-fi
-
-conda activate "$ENV_NAME"
-
 cd "$PROJECT_DIR"
 
-if ! command -v npm >/dev/null 2>&1; then
-  echo "npm was not found after activating conda environment: $ENV_NAME"
-  echo "Installing nodejs into conda environment: $ENV_NAME"
-  conda install -y -n "$ENV_NAME" -c conda-forge nodejs
-  conda activate "$ENV_NAME"
-fi
-
-if ! command -v npm >/dev/null 2>&1; then
-  echo "npm is still unavailable after installing nodejs."
-  echo "Please check the conda installation inside WSL."
-  exit 1
-fi
-
-python -m pip install -r backend/requirements.txt
+# This script activates the verified environment in the current shell.
+# shellcheck disable=SC1091
+source "$PROJECT_DIR/scripts/ensure_conda_env.sh"
 
 cd frontend
-npm install
-npm run build
+node_platform="$(node -p "process.platform + '-' + process.arch")"
+saved_node_platform="$(cat node_modules/.mpr-platform 2>/dev/null || true)"
+if [[ ! -d node_modules ]] \
+  || [[ package-lock.json -nt node_modules/.package-lock.json ]] \
+  || [[ "$node_platform" != "$saved_node_platform" ]]
+then
+  echo "[SETUP] Synchronizing frontend packages..."
+  npm ci
+  printf '%s\n' "$node_platform" > node_modules/.mpr-platform
+fi
+
+if [[ ! -f dist/index.html ]] \
+  || find src index.html vite.config.ts tsconfig.json -type f -newer dist/index.html -print -quit | grep -q .
+then
+  echo "[BUILD] Building the web interface..."
+  if ! npm run build; then
+    echo "[SETUP] Frontend build failed; reinstalling platform dependencies..."
+    npm ci
+    printf '%s\n' "$node_platform" > node_modules/.mpr-platform
+    npm run build
+  fi
+else
+  echo "[OK] Web interface is already up to date."
+fi
 
 cd "$PROJECT_DIR"
 echo ""
@@ -69,4 +41,21 @@ echo "Open this URL in your Windows browser:"
 echo "  http://localhost:8000"
 echo ""
 
-uvicorn backend.app:app --host 127.0.0.1 --port 8000
+APP_URL="${MPR_APP_URL:-http://localhost:8000}"
+if command -v cmd.exe >/dev/null 2>&1; then
+  (
+    for _attempt in $(seq 1 120); do
+      if python -c \
+        "import urllib.request; urllib.request.urlopen('$APP_URL/api/health', timeout=1).read()" \
+        >/dev/null 2>&1
+      then
+        cmd.exe /c start "" "$APP_URL" >/dev/null 2>&1
+        exit 0
+      fi
+      sleep 1
+    done
+    echo "[WARN] Server did not become ready within two minutes."
+  ) &
+fi
+
+exec uvicorn backend.app:app --host 127.0.0.1 --port 8000

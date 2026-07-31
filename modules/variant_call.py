@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from modules.utils import ensure_dir, run_cmd
+from modules.utils import ensure_dir, run_bash_pipeline
 
 
 def call_variants_per_gene(gene_bams: dict,
@@ -40,16 +40,28 @@ def call_variants_per_gene(gene_bams: dict,
             continue
 
         raw_vcf = out_dir / f"{gene}.raw.vcf.gz"
-        cmd = [
-            "bash", "-lc",
-            (
-                f"bcftools mpileup --threads {threads} -Ou -f {ref_fasta} {bam_path} "
-                f"| bcftools call --threads {threads} -mv -Oz -o {raw_vcf} && "
-                f"bcftools filter -i 'DP>={min_depth}' -Oz -o {vcf_out} {raw_vcf} && "
-                f"bcftools index -t {vcf_out}"
-            )
+        commands = [
+            [
+                "bcftools", "mpileup", "--threads", str(threads),
+                "-Ou", "-f", str(ref_fasta), str(bam_path),
+            ],
+            [
+                "bcftools", "call", "--threads", str(threads),
+                "-mv", "-Oz", "-o", str(raw_vcf),
+            ],
         ]
-        run_cmd(cmd, logger=logger, dry_run=dry_run)
+        run_bash_pipeline(
+            commands,
+            then=[
+                [
+                    "bcftools", "filter", "-i", f"DP>={min_depth}",
+                    "-Oz", "-o", str(vcf_out), str(raw_vcf),
+                ],
+                ["bcftools", "index", "-t", str(vcf_out)],
+            ],
+            logger=logger,
+            dry_run=dry_run,
+        )
         vcf_paths[gene] = vcf_out
 
     return vcf_paths

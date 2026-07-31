@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from modules.utils import ensure_dir, run_cmd
+from modules.utils import ensure_dir, run_bash_pipeline
 
 
 def _load_bed(bed_path: Path):
@@ -49,15 +49,22 @@ def extract_gene_bams(bam_path: Path,
 
         # samtools region strings are 1-based inclusive; BED is 0-based half-open.
         region_str = f"{chrom}:{start0 + 1}-{end0}"
-        cmd = [
-            "bash", "-lc",
-            (
-                f"samtools view -@ {threads} -b {bam_path} {region_str} "
-                f"| samtools sort -@ {threads} -o {out_bam} - && "
-                f"samtools index {out_bam}"
-            )
+        commands = [
+            [
+                "samtools", "view", "-@", str(threads), "-b",
+                str(bam_path), region_str,
+            ],
+            [
+                "samtools", "sort", "-@", str(threads),
+                "-o", str(out_bam), "-",
+            ],
         ]
-        run_cmd(cmd, logger=logger, dry_run=dry_run)
+        run_bash_pipeline(
+            commands,
+            then=[["samtools", "index", str(out_bam)]],
+            logger=logger,
+            dry_run=dry_run,
+        )
         gene_bams[gene] = out_bam
 
     return gene_bams

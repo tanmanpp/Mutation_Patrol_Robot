@@ -31,14 +31,33 @@ def number(value, default=0.0):
         return default
 
 
+def display_table_value(column: str, value):
+    labels = {
+        ("call_status", "NO_CALL"): "無法判斷 (NO_CALL)",
+        ("call_status", "MIXED_SIGNAL"): "多 allele 訊號 (MIXED_SIGNAL)",
+        ("call_status", "REFERENCE"): "與參考序列一致 (REFERENCE)",
+        ("call_status", "VARIANT"): "觀察到變異 (VARIANT)",
+        ("filter", "LOW_DEPTH"): "深度不足 (LOW_DEPTH)",
+        ("filter", "NO_MAPPING"): "沒有可用 reads (NO_MAPPING)",
+    }
+    return labels.get((column, value), value)
+
+
 def table_html(rows: list[dict], empty: str, page_size: int = 20):
     if not rows:
         return f'<div class="empty">{esc(empty)}</div>'
-    columns = list(rows[0].keys())
+    columns = [
+        column
+        for column in rows[0].keys()
+        if any(row.get(column, "") != "" for row in rows)
+    ]
     head = "".join(f"<th>{esc(column)}</th>" for column in columns)
     body_rows = []
     for row in rows:
-        cells = "".join(f"<td>{esc(row.get(column, ''))}</td>" for column in columns)
+        cells = "".join(
+            f"<td>{esc(display_table_value(column, row.get(column, '')))}</td>"
+            for column in columns
+        )
         body_rows.append(f"<tr>{cells}</tr>")
     return (
         f'<div class="paged-table" data-page-size="{page_size}">'
@@ -107,7 +126,7 @@ def site_query_chart(rows: list[dict], title: str):
     if not rows:
         return '<div class="empty">No site query chart data.</div>'
     items = []
-    for row in rows:
+    for row in sorted(rows, key=biological_position_sort_key):
         gene_name = row.get("Gene name") or row.get("Gene symbol") or row.get("gene") or ""
         position = row.get("aa_pos") or row.get("pos") or ""
         allele = row.get("alt_codon") or row.get("alt") or ""
@@ -155,6 +174,33 @@ def site_query_chart(rows: list[dict], title: str):
     return "".join(parts)
 
 
+def biological_position_sort_key(row: dict):
+    def optional_int(value):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    aa_pos = optional_int(row.get("aa_pos"))
+    cds_pos = optional_int(row.get("cds_pos"))
+    genomic_pos = optional_int(row.get("pos"))
+    if aa_pos is not None:
+        return (
+            0,
+            aa_pos,
+            cds_pos if cds_pos is not None else float("inf"),
+            genomic_pos if genomic_pos is not None else float("inf"),
+            str(row.get("alt") or row.get("alt_codon") or ""),
+        )
+    return (
+        1,
+        genomic_pos if genomic_pos is not None else float("inf"),
+        float("inf"),
+        float("inf"),
+        str(row.get("alt") or row.get("alt_codon") or ""),
+    )
+
+
 def load_summary(result_dir: Path):
     summary_path = result_dir / "tables" / "summary.json"
     if not summary_path.exists():
@@ -172,12 +218,32 @@ def load_site_queries(result_dir: Path):
         if not csv_path.exists():
             continue
         rows = read_csv_records(csv_path)
-        gene_name = rows[0].get("Gene name", query_dir.name) if rows else query_dir.name
+        scan_summary_path = query_dir / "scan_summary.json"
+        scan_summary = (
+            json.loads(scan_summary_path.read_text(encoding="utf-8"))
+            if scan_summary_path.exists() else {}
+        )
+        gene_name = (
+            rows[0].get("Gene name", query_dir.name)
+            if rows else scan_summary.get("gene_name", query_dir.name)
+        )
         queries.append({
             "query_id": query_dir.name,
             "gene_name": gene_name,
             "path": csv_path,
             "rows": rows,
+            "scan_summary": scan_summary,
+            "no_call_regions": read_csv_records(
+                query_dir / "no_call_regions.csv"
+            ),
+            "complete_table_path": (
+                query_dir / "complete_gene_table.csv"
+                if (query_dir / "complete_gene_table.csv").exists() else None
+            ),
+            "complete_rows": (
+                read_csv_records(query_dir / "complete_gene_table.csv")[:1000]
+                if (query_dir / "complete_gene_table.csv").exists() else []
+            ),
         })
     return queries
 
@@ -191,6 +257,8 @@ def render_html_report(result_dir: Path, out_html: Path | None = None):
     tables = result_dir / "tables"
     sample_summary = read_csv_records(tables / "sample_summary.csv")
     mutation_candidates = read_csv_records(tables / "mutation_candidates.csv")
+    coverage_summary = read_csv_records(result_dir / "coverage" / "gene_coverage.csv")
+    coverage_regions = read_csv_records(result_dir / "coverage" / "region_coverage.csv")
     summary = load_summary(result_dir)
     site_queries = load_site_queries(result_dir)
 
@@ -212,6 +280,7 @@ def render_html_report(result_dir: Path, out_html: Path | None = None):
             "Mutation candidates": len(mutation_candidates),
             "Site query tables": len(site_queries),
             "Site query rows": site_query_count,
+            "Coverage genes": len(coverage_summary),
             "Output folder": relative_path(result_dir),
         }),
         "<h2>Analysis Summary</h2>",
@@ -220,6 +289,21 @@ def render_html_report(result_dir: Path, out_html: Path | None = None):
         bar_svg(list(variant_counts.items()), "Mutation candidates by variant type", "#b85c38"),
         "<h2>Mutation Candidates</h2>",
         table_html(mutation_candidates, "No mutation candidates found."),
+        "<h2>Gene Coverage</h2>",
+        bar_svg(
+            [
+                (
+                    row.get("Gene name") or row.get("Gene symbol") or "",
+                    number(row.get("mean_depth")),
+                )
+                for row in coverage_summary
+            ],
+            "Mean depth by gene",
+            "#2f6f9f",
+        ),
+        table_html(coverage_summary, "No gene coverage found."),
+        "<h2>Amplicon / Target-region Coverage</h2>",
+        table_html(coverage_regions, "No target-region coverage found."),
         "<h2>Site Query</h2>",
     ]
 
@@ -228,8 +312,57 @@ def render_html_report(result_dir: Path, out_html: Path | None = None):
             sections.extend([
                 f"<section class=\"site-query\"><h3>{esc(item['gene_name'])}</h3>",
                 f"<p class=\"subtle\">Source: {esc(relative_path(item['path']))}</p>",
+            ])
+            if item["scan_summary"]:
+                sections.extend([
+                    "<h4>Whole Gene Scan Summary</h4>",
+                    table_html(
+                        [{
+                            key: (
+                                json.dumps(value, ensure_ascii=False)
+                                if isinstance(value, (dict, list)) else value
+                            )
+                            for key, value in item["scan_summary"].items()
+                        }],
+                        "No scan summary found.",
+                    ),
+                    "<h4>NO_CALL Regions</h4>",
+                    table_html(
+                        item["no_call_regions"],
+                        "No NO_CALL regions found.",
+                    ),
+                ])
+            sections.extend([
                 site_query_chart(item["rows"], f"Depth and allele frequency - {item['gene_name']}"),
-                table_html(item["rows"], "No site query rows found."),
+                table_html(
+                    sorted(item["rows"], key=biological_position_sort_key),
+                    "No supported variant rows found.",
+                ),
+                "<h4>Coding and Amino-acid Details</h4>",
+                table_html(
+                    sorted([
+                        row for row in item["rows"]
+                        if row.get("region_type") == "CDS"
+                    ], key=biological_position_sort_key),
+                    "No coding-region changes found.",
+                ),
+            ])
+            if item["complete_table_path"]:
+                relative_complete = item["complete_table_path"].relative_to(
+                    result_dir
+                ).as_posix()
+                sections.extend([
+                    "<h4>Complete Gene Table</h4>",
+                    (
+                        f'<p><a href="{esc(relative_complete)}">'
+                        "Open complete CSV</a> — preview limited to 1,000 rows.</p>"
+                    ),
+                    table_html(
+                        item["complete_rows"],
+                        "No complete table rows found.",
+                    ),
+                ])
+            sections.extend([
                 "</section>",
             ])
     else:

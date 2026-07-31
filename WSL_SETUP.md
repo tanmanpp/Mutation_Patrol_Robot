@@ -20,10 +20,11 @@ start_mutation_patrol_robot.bat
 The launcher will:
 
 - enter WSL automatically
-- create or reuse the conda environment `mutation_patrol`
-- install Python, Node.js, `samtools`, `bcftools`, and `minimap2`
-- install backend/frontend dependencies
-- build the web UI
+- check that WSL and conda are available
+- create or synchronize the conda environment `mutation_patrol`
+- verify Python, Node.js, `samtools`, `bcftools`, and `minimap2`
+- install backend/frontend dependencies only when needed
+- build the web UI only when its source changed
 - start the server
 
 When the server is ready, open:
@@ -75,7 +76,13 @@ conda --version
 
 ## Conda Environment
 
-The app launcher creates this environment automatically:
+The environment definition is stored in:
+
+```text
+environment.yml
+```
+
+The app launcher creates or synchronizes this environment automatically:
 
 ```text
 mutation_patrol
@@ -94,7 +101,17 @@ minimap2
 
 You usually do not need to create this environment yourself. The first launch
 may take several minutes because packages and frontend dependencies are
-installed.
+installed. Later launches reuse the verified environment.
+
+To verify the active environment manually:
+
+```bash
+conda activate mutation_patrol
+python scripts/check_environment.py
+```
+
+The command exits with an error and lists every missing component when the
+environment is incomplete.
 
 ## Manual Start from WSL
 
@@ -117,6 +134,8 @@ project path.
 ## Development Mode
 
 Use this only if you are editing the backend or frontend and want live reload.
+Both development launchers run the same conda preflight as the normal app
+launcher before starting.
 
 Open one WSL terminal for the backend:
 
@@ -231,5 +250,9 @@ minimap2 --version
 If any command is missing, reinstall the environment packages:
 
 ```bash
-conda install -n mutation_patrol -c conda-forge -c bioconda samtools bcftools minimap2
+conda env update -n mutation_patrol -f environment.yml --prune
+python -m pip install -r backend/requirements.txt
 ```
+
+You can also delete `app_data/.environment.sha256` and start the app again to
+force the launcher to synchronize the environment.

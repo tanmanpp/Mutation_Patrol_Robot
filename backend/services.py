@@ -1,20 +1,26 @@
 # -*- coding: utf-8 -*-
 
+from __future__ import annotations
+
 import csv
 import json
 import shutil
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from fastapi import UploadFile
+if TYPE_CHECKING:
+    from fastapi import UploadFile
 
 from modules.bam_allele_freq import mutation_candidates_from_bam
+from modules.bam_utils import prepare_sorted_bam
+from modules.coverage import generate_coverage_tables
 from modules.gene_database import build_gene_database_from_annotations, load_gene_database
 from modules.html_report import render_html_report
 from modules.mapping import map_reads_to_ref
 from modules.report import write_tables
 from modules.roi_extract import extract_gene_bams
-from modules.site_query import query_bam_sites
-from modules.utils import ensure_dir, make_json_safe, relative_path, resolve_project_path, setup_logger, write_run_metadata
+from modules.site_query import query_bam_sites, scan_bam_gene_region
+from modules.utils import ensure_dir, make_json_safe, relative_path, resolve_project_path, setup_logger
 from modules.variant_call import call_variants_per_gene
 from modules.annotate_mut import variants_to_aa_table
 
@@ -23,10 +29,21 @@ from .config import DATABASES_DIR, LEGACY_DATABASES_DIR, RESULTS_DIR, UPLOADS_DI
 
 def safe_name(value: str):
     cleaned = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in value.strip())
+    cleaned = cleaned.strip(".")
     return cleaned or "run"
 
 
-async def save_upload(upload: UploadFile, dest: Path):
+def safe_upload_filename(value: str):
+    leaf_name = Path((value or "").replace("\\", "/")).name
+    cleaned = safe_name(leaf_name)
+    if cleaned in {"run", ".", ".."} and leaf_name not in {"run", "run."}:
+        raise ValueError("Uploaded file has an invalid filename.")
+    return cleaned
+
+
+async def save_upload(upload: "UploadFile", dest_dir: Path, prefix: str = ""):
+    filename = f"{prefix}{safe_upload_filename(upload.filename or '')}"
+    dest = dest_dir / filename
     ensure_dir(dest.parent)
     with open(dest, "wb") as handle:
         while True:
@@ -36,6 +53,17 @@ async def save_upload(upload: UploadFile, dest: Path):
             handle.write(chunk)
     await upload.close()
     return dest
+
+
+def runtime_health():
+    tools = {}
+    for command in ["samtools", "bcftools", "minimap2"]:
+        path = shutil.which(command)
+        tools[command] = {"ok": bool(path), "path": path or ""}
+    return {
+        "ok": all(item["ok"] for item in tools.values()),
+        "tools": tools,
+    }
 
 
 def read_csv_records(path: Path, limit: int | None = None):
@@ -142,6 +170,7 @@ def analyze_sample(
     min_depth: int,
     threads: int,
     min_mapq: int,
+    min_baseq: int,
     min_alt_count: int,
     min_alt_freq: float,
     candidate_source: str,
@@ -166,8 +195,14 @@ def analyze_sample(
 
     bed_path = db_path.parent / "gene_regions.bed"
     if bam_path:
-        source_bam = bam_path
-        logger.info(f"Using uploaded BAM: {source_bam}")
+        source_bam = prepare_sorted_bam(
+            source_bam=bam_path,
+            dest_bam=bam_dir / "merged.sorted.bam",
+            threads=threads,
+            force=force,
+            logger=logger,
+        )
+        logger.info(f"Prepared uploaded BAM: {source_bam}")
     elif fastq_path:
         source_bam = map_reads_to_ref(
             raw_dir=None,
@@ -203,6 +238,7 @@ def analyze_sample(
             min_alt_count=min_alt_count,
             min_alt_freq=min_alt_freq,
             min_mapq=min_mapq,
+            min_baseq=min_baseq,
             dry_run=False,
             force=force,
             logger=logger,
@@ -238,7 +274,22 @@ def analyze_sample(
             "gene_count": gene_db.get("gene_count", 0),
             "candidate_source": candidate_source,
             "threads": threads,
+            "min_depth": min_depth,
+            "min_mapq": min_mapq,
+            "min_baseq": min_baseq,
+            "min_alt_count": min_alt_count,
+            "min_alt_freq": min_alt_freq,
         },
+        logger=logger,
+    )
+    generate_coverage_tables(
+        gene_db_path=db_path,
+        bam_path=source_bam,
+        out_dir=out_dir / "coverage",
+        minimum_call_depth=max(1, min_depth),
+        min_mapq=min_mapq,
+        min_baseq=min_baseq,
+        force=force,
         logger=logger,
     )
 
@@ -250,14 +301,23 @@ def query_sites(
     db_name: str,
     gene: str,
     query_type: str,
-    query_value: str,
+    query_value: str | None,
     alt: str | None,
     min_alt_freq: float,
     min_mapq: int,
+    min_depth: int,
+    min_baseq: int,
+    min_allele_count: int,
     force: bool,
 ):
     analysis_id = safe_name(analysis_run)
-    query_id = safe_name(gene)
+    if query_type == "gene_region":
+        values = []
+        query_id = safe_name(f"{gene}_whole_gene")
+    else:
+        values = parse_query_values(query_value or "")
+        value_label = "-".join(str(value) for value in values)
+        query_id = safe_name(f"{gene}_{query_type}_{value_label}")
     analysis_dir = RESULTS_DIR / analysis_id
     bam_path = analysis_dir / "work" / "bam" / "merged.sorted.bam"
     if not bam_path.exists():
@@ -267,28 +327,96 @@ def query_sites(
     ensure_dir(out_dir)
     logger = setup_logger(out_dir / "query_sites.log")
     out_csv = out_dir / "site_query.csv"
-    kwargs = {"genomic_pos": None, "cds_pos": None, "aa_pos": None}
-    values = parse_query_values(query_value)
-    kwargs[query_type] = values
-    query_bam_sites(
-        gene_db_path=get_database_path(db_name),
-        bam_path=bam_path,
-        out_csv=out_csv,
-        gene=gene,
-        alt=alt,
-        ref_fasta=None,
-        min_mapq=min_mapq,
-        min_alt_freq=min_alt_freq,
-        force=force,
-        logger=logger,
-        **kwargs,
-    )
-    return {
+    db_path = get_database_path(db_name)
+    if query_type == "gene_region":
+        scan_bam_gene_region(
+            gene_db_path=db_path,
+            bam_path=bam_path,
+            out_csv=out_csv,
+            gene=gene,
+            ref_fasta=None,
+            min_mapq=min_mapq,
+            min_alt_freq=min_alt_freq,
+            min_depth=min_depth,
+            min_baseq=min_baseq,
+            min_allele_count=min_allele_count,
+            force=force,
+            logger=logger,
+        )
+    else:
+        kwargs = {"genomic_pos": None, "cds_pos": None, "aa_pos": None}
+        kwargs[query_type] = values
+        query_bam_sites(
+            gene_db_path=db_path,
+            bam_path=bam_path,
+            out_csv=out_csv,
+            gene=gene,
+            alt=alt,
+            ref_fasta=None,
+            min_mapq=min_mapq,
+            min_alt_freq=min_alt_freq,
+            min_depth=min_depth,
+            min_baseq=min_baseq,
+            min_allele_count=min_allele_count,
+            force=force,
+            logger=logger,
+            **kwargs,
+        )
+    response = {
         "run_id": analysis_id,
         "query_id": query_id,
         "gene": gene,
+        "query_type": query_type,
         "site_query_table": relative_path(out_csv),
         "rows": read_csv_records(out_csv),
+    }
+    summary_path = out_dir / "scan_summary.json"
+    no_call_path = out_dir / "no_call_regions.csv"
+    complete_table_path = out_dir / "complete_gene_table.csv"
+    if summary_path.exists():
+        response["scan_summary"] = make_json_safe(
+            json.loads(summary_path.read_text(encoding="utf-8"))
+        )
+    if no_call_path.exists():
+        response["no_call_regions"] = read_csv_records(no_call_path)
+    if complete_table_path.exists():
+        response["complete_table"] = relative_path(complete_table_path)
+        response["complete_rows"] = read_csv_records(
+            complete_table_path, limit=1000
+        )
+    return response
+
+
+def generate_coverage(
+    analysis_run: str,
+    db_name: str,
+    minimum_call_depth: int,
+    min_mapq: int,
+    min_baseq: int,
+    force: bool,
+):
+    analysis_id = safe_name(analysis_run)
+    analysis_dir = RESULTS_DIR / analysis_id
+    bam_path = analysis_dir / "work" / "bam" / "merged.sorted.bam"
+    if not bam_path.exists():
+        raise FileNotFoundError(f"Analysis BAM not found: {bam_path}")
+    out_dir = analysis_dir / "coverage"
+    ensure_dir(out_dir)
+    logger = setup_logger(out_dir / "coverage.log")
+    generate_coverage_tables(
+        gene_db_path=get_database_path(db_name),
+        bam_path=bam_path,
+        out_dir=out_dir,
+        minimum_call_depth=minimum_call_depth,
+        min_mapq=min_mapq,
+        min_baseq=min_baseq,
+        force=force,
+        logger=logger,
+    )
+    return {
+        "run_id": analysis_id,
+        "coverage_summary": read_csv_records(out_dir / "gene_coverage.csv"),
+        "coverage_regions": read_csv_records(out_dir / "region_coverage.csv"),
     }
 
 
@@ -346,8 +474,10 @@ def sample_upload_stats():
     }
 
 
-def get_result(run_id: str):
+def get_result(run_id: str, include_rows: bool = True):
     result_dir = RESULTS_DIR / safe_name(run_id)
+    if not result_dir.exists():
+        raise FileNotFoundError(f"Result not found: {run_id}")
     tables = result_dir / "tables"
     summary_path = tables / "summary.json"
     summary = {}
@@ -356,11 +486,46 @@ def get_result(run_id: str):
     return {
         "run_id": result_dir.name,
         "summary": summary,
-        "sample_summary": read_csv_records(tables / "sample_summary.csv"),
-        "mutation_candidates": read_csv_records(tables / "mutation_candidates.csv", limit=500),
-        "site_query": read_latest_site_query(result_dir),
-        "site_queries": read_site_queries(result_dir),
+        "sample_summary": read_csv_records(tables / "sample_summary.csv") if include_rows else [],
+        "mutation_candidates": (
+            read_csv_records(tables / "mutation_candidates.csv", limit=500)
+            if include_rows else []
+        ),
+        "site_query": read_latest_site_query(result_dir) if include_rows else [],
+        "site_queries": read_site_queries(result_dir) if include_rows else [],
+        "coverage_summary": (
+            read_csv_records(result_dir / "coverage" / "gene_coverage.csv")
+            if include_rows else []
+        ),
+        "coverage_regions": (
+            read_csv_records(result_dir / "coverage" / "region_coverage.csv")
+            if include_rows else []
+        ),
         "html_report": relative_path(result_dir / "final_report.html") if (result_dir / "final_report.html").exists() else "",
+        "updated_at": result_dir.stat().st_mtime,
+    }
+
+
+def get_gene_coverage(run_id: str, gene: str):
+    result_dir = RESULTS_DIR / safe_name(run_id)
+    index_path = result_dir / "coverage" / "coverage_index.json"
+    if not index_path.exists():
+        raise FileNotFoundError(
+            f"Coverage has not been generated for result: {run_id}"
+        )
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    gene_entry = (index.get("genes") or {}).get(gene)
+    if not gene_entry:
+        raise FileNotFoundError(f"Coverage gene not found: {gene}")
+    file_name = Path(gene_entry["file"]).name
+    position_path = result_dir / "coverage" / "positions" / file_name
+    return {
+        "run_id": result_dir.name,
+        "gene": gene,
+        "minimum_call_depth": index.get("minimum_call_depth", 10),
+        "min_mapq": index.get("min_mapq", 20),
+        "min_baseq": index.get("min_baseq", 20),
+        "points": read_csv_records(position_path),
     }
 
 
@@ -400,15 +565,42 @@ def read_site_queries(result_dir: Path):
             "path": relative_path(csv_path),
             "updated_at": query_dir.stat().st_mtime,
             "rows": read_csv_records(csv_path, limit=500),
+            "scan_summary": (
+                make_json_safe(json.loads(
+                    (query_dir / "scan_summary.json").read_text(encoding="utf-8")
+                ))
+                if (query_dir / "scan_summary.json").exists() else {}
+            ),
+            "no_call_regions": read_csv_records(
+                query_dir / "no_call_regions.csv", limit=500
+            ),
+            "complete_table": (
+                relative_path(query_dir / "complete_gene_table.csv")
+                if (query_dir / "complete_gene_table.csv").exists() else ""
+            ),
+            "complete_rows": read_csv_records(
+                query_dir / "complete_gene_table.csv", limit=1000
+            ),
         })
     return items
+
+
+def get_complete_gene_table_path(run_id: str, query_id: str):
+    result_dir = RESULTS_DIR / safe_name(run_id)
+    query_dir = result_dir / "site_query" / safe_name(query_id)
+    table_path = query_dir / "complete_gene_table.csv"
+    if not table_path.exists():
+        raise FileNotFoundError(
+            f"Complete gene table not found: {run_id}/{query_id}"
+        )
+    return table_path
 
 
 def list_results():
     runs = []
     for result_dir in sorted(RESULTS_DIR.iterdir()) if RESULTS_DIR.exists() else []:
-        if result_dir.is_dir():
-            runs.append(get_result(result_dir.name))
+        if result_dir.is_dir() and (result_dir / "tables" / "summary.json").exists():
+            runs.append(get_result(result_dir.name, include_rows=False))
     return runs
 
 

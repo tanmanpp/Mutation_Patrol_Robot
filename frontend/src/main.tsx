@@ -9,6 +9,7 @@ import {
   LabelList,
   Legend,
   Line,
+  LineChart,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -40,6 +41,8 @@ type ResultPayload = {
   mutation_candidates: Record<string, string>[];
   site_query: Record<string, string>[];
   site_queries?: SiteQueryResult[];
+  coverage_summary?: Record<string, string>[];
+  coverage_regions?: Record<string, string>[];
   html_report?: string;
 };
 
@@ -48,6 +51,10 @@ type SiteQueryResult = {
   path: string;
   updated_at: number;
   rows: Record<string, string>[];
+  scan_summary?: Record<string, unknown>;
+  no_call_regions?: Record<string, string>[];
+  complete_table?: string;
+  complete_rows?: Record<string, string>[];
 };
 
 type UploadStats = {
@@ -56,11 +63,87 @@ type UploadStats = {
   dir_count: number;
 };
 
-function Field(props: { label: string; children: React.ReactNode }) {
+type JobPayload<T = unknown> = {
+  job_id: string;
+  kind: string;
+  label: string;
+  status: "queued" | "running" | "completed" | "failed" | "cancelled";
+  message: string;
+  result: T | null;
+  error_type?: string;
+};
+
+type SiteQueryPayload = {
+  run_id: string;
+  query_id: string;
+  gene: string;
+  query_type?: string;
+};
+
+type CoveragePayload = {
+  run_id: string;
+  coverage_summary: Record<string, string>[];
+  coverage_regions: Record<string, string>[];
+};
+
+type CoveragePointPayload = {
+  run_id: string;
+  gene: string;
+  minimum_call_depth: number;
+  min_mapq: number;
+  min_baseq: number;
+  points: Record<string, string>[];
+};
+
+const FIELD_HELP: Record<string, string> = {
+  "Database name": "自訂基因庫的識別名稱。建議使用英文字母、數字、連字號或底線，例如 pf3d7_targets。",
+  "Reference FASTA": "上傳與 BAM 或 FASTQ 分析所用版本相同的參考基因組 FASTA；contig 名稱與座標必須一致。",
+  "Gene JSONL files": "上傳 NCBI Datasets Gene 的 Product report JSONL。可以一次選擇多個基因註解檔。",
+  "Gene JSONL folder": "選擇包含多個 .jsonl 基因註解檔的資料夾；系統只會讀取其中的 JSONL 檔案。",
+  "Gene symbols filter": "選填。只建立指定的 gene symbols，多個名稱請用逗號分隔；留白表示匯入全部上傳的註解。",
+  "Run name": "這次樣本分析的識別名稱，也會成為結果資料夾名稱；請使用容易辨識且不與既有 run 重複的名稱。",
+  "Gene database": "選擇本次分析或查詢使用的參考基因庫；它應與樣本比對所用的參考基因組版本一致。",
+  FASTQ: "上傳一個 FASTQ 或 FASTQ.GZ 檔。FASTQ 與 BAM 必須擇一上傳，不可同時使用。",
+  BAM: "上傳一個 BAM 檔。系統會進行排序並建立 index；BAM 的 contig 名稱必須與所選基因庫相符。",
+  "Candidate source": "BAM pileup 會保留深度、allele frequency 與 MIXED_SIGNAL 資訊；VCF caller 適合標準變異呼叫，但可用的 allele QC 資訊可能較少。",
+  "Minimum depth": "一個位置至少需要多少個合格 reads 才可分析；低於此值的點位會視為 NO_CALL／無法判斷。",
+  Threads: "分析可使用的 CPU 執行緒數。數值較高通常較快，但也會使用更多電腦資源。",
+  "Minimum alt count": "替代 allele 至少需要多少個 reads 支持才會列為候選；設為 1 對低頻訊號較敏感，也較容易納入雜訊。",
+  "Minimum base quality": "只計算 Phred base quality 達到此門檻的鹼基；20 約代表 1% 的鹼基判讀錯誤率。",
+  "Minimum alt frequency": "替代 allele 占合格 reads 的最低比例。0.05 代表 5%；降低門檻會增加低頻訊號，也可能增加雜訊。",
+  "Analysis run": "選擇一個已完成、且仍保留 merged.sorted.bam 的分析結果，作為這次查詢或 coverage 計算的資料來源。",
+  Gene: "選擇要掃描完整註解區段或查詢指定點位的基因。",
+  "Position type": "Whole annotated gene 會掃描 gene_start 到 gene_end 的整個註解區段；其他模式則分別使用 genomic、CDS 或胺基酸座標。",
+  Positions: "只有指定點位模式需要填寫。可輸入多個 1-based 位置並用逗號分隔，例如 436,437,540。",
+  Allele: "選填，僅用於指定點位模式。可輸入想確認的鹼基、codon 或胺基酸；完整基因掃描會自動尋找所有合格變異。",
+  "Minimum depth for a call": "點位至少需要多少個合格 reads 才能判讀；低於此值會回報 NO_CALL／無法判斷，而不是野生型。",
+  "Minimum mapping quality": "只使用 mapping quality 達到此門檻的 reads。20 常作為基本篩選；提高門檻會更嚴格。",
+  "Minimum allele support": "某個 allele 至少需要多少個 reads 支持，才能參與 VARIANT 或 MIXED_SIGNAL 判定；預設為 2。",
+  "Minimum call depth": "Coverage 中判定某位置為 CALLABLE 的最低深度；低於此值的區域會列為 NO_CALL／無法判斷。",
+};
+
+function Field(props: { label: string; help?: string; children: React.ReactNode }) {
+  const help = props.help ?? FIELD_HELP[props.label];
   return (
     <label className="field">
-      <span>{props.label}</span>
+      <span className="fieldLabel">
+        {props.label}
+        {help && (
+          <span
+            className="fieldHelpIcon"
+            aria-label={`${props.label} 說明：${help}`}
+            tabIndex={0}
+          >
+            ?
+          </span>
+        )}
+      </span>
       {props.children}
+      {help && (
+        <span className="fieldTooltip" role="tooltip">
+          {help}
+        </span>
+      )}
     </label>
   );
 }
@@ -76,7 +159,14 @@ function FolderInput(props: { name: string }) {
 }
 
 function DataTable({ rows, empty }: { rows: Record<string, string>[]; empty: string }) {
-  const columns = useMemo(() => (rows[0] ? Object.keys(rows[0]) : []), [rows]);
+  const columns = useMemo(
+    () => (
+      rows[0]
+        ? Object.keys(rows[0]).filter((column) => rows.some((row) => row[column] !== ""))
+        : []
+    ),
+    [rows],
+  );
   if (!rows.length) return <div className="empty">{empty}</div>;
   return (
     <div className="tableWrap">
@@ -87,7 +177,9 @@ function DataTable({ rows, empty }: { rows: Record<string, string>[]; empty: str
         <tbody>
           {rows.map((row, rowIndex) => (
             <tr key={rowIndex}>
-              {columns.map((column) => <td key={column}>{row[column]}</td>)}
+              {columns.map((column) => (
+                <td key={column}>{displayTableValue(column, row[column])}</td>
+              ))}
             </tr>
           ))}
         </tbody>
@@ -122,7 +214,14 @@ function compareCellValues(left: string | undefined, right: string | undefined) 
 }
 
 function PaginatedSortableTable({ rows, empty }: { rows: Record<string, string>[]; empty: string }) {
-  const columns = useMemo(() => (rows[0] ? Object.keys(rows[0]) : []), [rows]);
+  const columns = useMemo(
+    () => (
+      rows[0]
+        ? Object.keys(rows[0]).filter((column) => rows.some((row) => row[column] !== ""))
+        : []
+    ),
+    [rows],
+  );
   const [sortColumn, setSortColumn] = useState("");
   const [sortDirection, setSortDirection] = useState<"asc" | "desc">("asc");
   const [page, setPage] = useState(1);
@@ -185,7 +284,9 @@ function PaginatedSortableTable({ rows, empty }: { rows: Record<string, string>[
           <tbody>
             {pageRows.map((row, rowIndex) => (
               <tr key={rowIndex}>
-                {columns.map((column) => <td key={column}>{row[column]}</td>)}
+                {columns.map((column) => (
+                  <td key={column}>{displayTableValue(column, row[column])}</td>
+                ))}
               </tr>
             ))}
           </tbody>
@@ -206,6 +307,8 @@ type SiteChartDatum = {
   filter: string;
   variantType: string;
   aaChange: string;
+  callStatus: string;
+  alleleSpectrum: string;
 };
 
 type SiteCombinedDatum = {
@@ -221,6 +324,66 @@ function parseNumber(value: string | undefined) {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
+function optionalNumber(value: string | undefined) {
+  if (value === undefined || value === "") return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function compareBiologicalPositions(
+  left: Record<string, string>,
+  right: Record<string, string>,
+) {
+  const leftAa = optionalNumber(left.aa_pos);
+  const rightAa = optionalNumber(right.aa_pos);
+  if (leftAa !== null || rightAa !== null) {
+    if (leftAa === null) return 1;
+    if (rightAa === null) return -1;
+    if (leftAa !== rightAa) return leftAa - rightAa;
+  }
+
+  const leftCds = optionalNumber(left.cds_pos);
+  const rightCds = optionalNumber(right.cds_pos);
+  if (leftCds !== null || rightCds !== null) {
+    if (leftCds === null) return 1;
+    if (rightCds === null) return -1;
+    if (leftCds !== rightCds) return leftCds - rightCds;
+  }
+
+  const leftGenomic = optionalNumber(left.pos || left.genomic_pos);
+  const rightGenomic = optionalNumber(right.pos || right.genomic_pos);
+  if (leftGenomic !== null && rightGenomic !== null && leftGenomic !== rightGenomic) {
+    return leftGenomic - rightGenomic;
+  }
+  return compareCellValues(left.alt || left.alt_codon, right.alt || right.alt_codon);
+}
+
+function sortByBiologicalPosition(rows: Record<string, string>[]) {
+  return [...rows].sort(compareBiologicalPositions);
+}
+
+function displayTableValue(column: string, value: string | undefined) {
+  if (column === "call_status" && value === "NO_CALL") {
+    return "無法判斷 (NO_CALL)";
+  }
+  if (column === "call_status" && value === "MIXED_SIGNAL") {
+    return "多 allele 訊號 (MIXED_SIGNAL)";
+  }
+  if (column === "call_status" && value === "REFERENCE") {
+    return "與參考序列一致 (REFERENCE)";
+  }
+  if (column === "call_status" && value === "VARIANT") {
+    return "觀察到變異 (VARIANT)";
+  }
+  if (column === "filter" && value === "LOW_DEPTH") {
+    return "深度不足 (LOW_DEPTH)";
+  }
+  if (column === "filter" && value === "NO_MAPPING") {
+    return "沒有可用 reads (NO_MAPPING)";
+  }
+  return value || "";
+}
+
 function siteQueryLabel(row: Record<string, string>) {
   const gene = row["Gene symbol"] || row.gene || "";
   const geneName = row["Gene name"] || gene;
@@ -234,7 +397,7 @@ function siteQueryLabel(row: Record<string, string>) {
 }
 
 function siteQueryChartData(rows: Record<string, string>[]): SiteChartDatum[] {
-  return rows.map((row, index) => ({
+  return sortByBiologicalPosition(rows).map((row, index) => ({
     label: siteQueryLabel(row) || `site ${index + 1}`,
     gene: row["Gene symbol"] || row.gene || "",
     geneDescription: row["Gene name"] || "",
@@ -245,6 +408,8 @@ function siteQueryChartData(rows: Record<string, string>[]): SiteChartDatum[] {
     filter: row.filter || "",
     variantType: row.variant_type || "",
     aaChange: row.aa_change || "",
+    callStatus: row.call_status || "",
+    alleleSpectrum: row.allele_spectrum || "",
   }));
 }
 
@@ -260,7 +425,54 @@ function sitePositionLabel(item: SiteChartDatum) {
 function siteQueryDisplayName(query: SiteQueryResult) {
   const firstRow = query.rows?.[0];
   const geneName = firstRow?.["Gene name"];
+  if (query.scan_summary?.scan_type === "whole_gene") {
+    return `${String(query.scan_summary.gene_name || geneName || query.query_id)} — whole gene`;
+  }
   return geneName || query.query_id;
+}
+
+function scanSummaryRows(summary: Record<string, unknown> | undefined) {
+  if (!summary) return [];
+  const preferred = [
+    "gene", "gene_name", "chrom", "start", "end", "gene_length",
+    "callable_positions", "callable_percent", "no_call_positions",
+    "no_call_regions", "reference_only_positions", "variant_sites",
+    "variant_rows", "complete_table_rows", "mixed_signal_sites",
+    "variant_type_counts",
+  ];
+  return preferred
+    .filter((key) => summary[key] !== undefined)
+    .map((key) => ({
+      metric: key,
+      value: (
+        typeof summary[key] === "object"
+          ? JSON.stringify(summary[key])
+          : String(summary[key])
+      ),
+    }));
+}
+
+function aminoAcidDetailRows(rows: Record<string, string>[]) {
+  return sortByBiologicalPosition(rows)
+    .filter((row) => row.region_type === "CDS")
+    .map((row) => ({
+      gene: row["Gene symbol"] || row.gene || "",
+      genomic_pos: row.pos || "",
+      variant_type: row.variant_type || "",
+      nucleotide_change: `${row.ref || ""}>${row.alt || ""}`,
+      cds_pos: row.cds_pos || "",
+      codon_pos: row.codon_pos || "",
+      codon_change: row.codon_change || "",
+      aa_pos: row.aa_pos || "",
+      ref_aa: row.ref_aa || "",
+      ref_aa_name: row.ref_aa_name || "",
+      alt_aa: row.alt_aa || "",
+      alt_aa_name: row.alt_aa_name || "",
+      aa_change: row.aa_change || "",
+      effect: row.effect || "",
+      allele_freq: row.allele_freq || "",
+      call_status: row.call_status || "",
+    }));
 }
 
 function siteQueryCombinedData(data: SiteChartDatum[]): SiteCombinedDatum[] {
@@ -279,7 +491,7 @@ function siteQueryCombinedData(data: SiteChartDatum[]): SiteCombinedDatum[] {
     if (current.filter !== "NO_MAPPING" && item.filter === "NO_MAPPING") {
       current.filter = item.filter;
     }
-    if (item.variantType !== "REF") {
+    if (item.variantType !== "REF" && item.variantType !== "NO_CALL") {
       current.mutationFreq += item.alleleFreq;
     }
     grouped.set(key, current);
@@ -291,7 +503,8 @@ function siteQueryCombinedData(data: SiteChartDatum[]): SiteCombinedDatum[] {
 }
 
 function chartColor(item: SiteChartDatum) {
-  if (item.filter === "NO_MAPPING") return "#a3adb0";
+  if (item.callStatus === "NO_CALL") return "#a3adb0";
+  if (item.callStatus === "MIXED_SIGNAL") return "#d38b2f";
   if (item.variantType === "REF") return "#79a99b";
   if (item.variantType === "CODON") return "#b85c38";
   return "#2f6f9f";
@@ -308,6 +521,8 @@ function SiteTooltip({ active, payload, label }: { active?: boolean; payload?: a
       {item.position && <span>Position: {item.position}</span>}
       {item.allele && <span>Allele: {item.allele}</span>}
       {item.filter && <span>Status: {item.filter}</span>}
+      {item.callStatus && <span>Call: {displayTableValue("call_status", item.callStatus)}</span>}
+      {item.alleleSpectrum && <span>Alleles: {item.alleleSpectrum}</span>}
       {payload.map((entry) => (
         <span key={entry.name}>
           {entry.name}: {entry.name?.includes("frequency")
@@ -381,6 +596,83 @@ function SiteQueryCharts({ rows }: { rows: Record<string, string>[] }) {
   );
 }
 
+type CoverageChartPoint = {
+  position: number;
+  depth: number;
+  minimumDepth: number;
+};
+
+function coverageChartData(
+  points: Record<string, string>[],
+  minimumDepth: number,
+): CoverageChartPoint[] {
+  if (!points.length) return [];
+  const maxPoints = 1200;
+  const step = Math.max(1, Math.ceil(points.length / maxPoints));
+  const output: CoverageChartPoint[] = [];
+  for (let index = 0; index < points.length; index += step) {
+    const bucket = points.slice(index, index + step);
+    const totalDepth = bucket.reduce((sum, point) => sum + parseNumber(point.depth), 0);
+    output.push({
+      position: parseNumber(bucket[Math.floor(bucket.length / 2)]?.pos),
+      depth: totalDepth / bucket.length,
+      minimumDepth,
+    });
+  }
+  return output;
+}
+
+function CoverageChart({
+  payload,
+}: {
+  payload: CoveragePointPayload | null;
+}) {
+  const data = useMemo(
+    () => coverageChartData(payload?.points || [], payload?.minimum_call_depth || 10),
+    [payload],
+  );
+  if (!payload || !data.length) {
+    return <div className="empty">Select a gene to view position-level coverage.</div>;
+  }
+  return (
+    <section className="chartPanel chartPanelWide">
+      <h3>{payload.gene} Position Coverage</h3>
+      <p className="helperText">
+        Depth is displayed across the selected gene or amplicon-aligned region.
+        This is coverage evidence only and is not a CNV estimate.
+      </p>
+      <ResponsiveContainer width="100%" height={330}>
+        <LineChart data={data} margin={{ top: 14, right: 24, bottom: 42, left: 0 }}>
+          <CartesianGrid strokeDasharray="3 3" vertical={false} />
+          <XAxis
+            dataKey="position"
+            type="number"
+            domain={["dataMin", "dataMax"]}
+            tick={{ fontSize: 11 }}
+          />
+          <YAxis allowDecimals={false} />
+          <Tooltip />
+          <Legend />
+          <Line
+            dataKey="depth"
+            name="Mean depth"
+            stroke="#2f6f9f"
+            dot={false}
+            strokeWidth={1.5}
+          />
+          <Line
+            dataKey="minimumDepth"
+            name="Minimum call depth"
+            stroke="#b85c38"
+            dot={false}
+            strokeDasharray="6 4"
+          />
+        </LineChart>
+      </ResponsiveContainer>
+    </section>
+  );
+}
+
 function App() {
   const [databases, setDatabases] = useState<Database[]>([]);
   const [selectedDb, setSelectedDb] = useState("");
@@ -392,11 +684,47 @@ function App() {
   const [results, setResults] = useState<ResultPayload[]>([]);
   const [selectedResultId, setSelectedResultId] = useState("");
   const [selectedSiteQueryId, setSelectedSiteQueryId] = useState("");
+  const [siteQueryType, setSiteQueryType] = useState("gene_region");
+  const [coverageGene, setCoverageGene] = useState("");
+  const [coveragePoints, setCoveragePoints] = useState<CoveragePointPayload | null>(null);
   const [uploadStats, setUploadStats] = useState<UploadStats>({ total_bytes: 0, file_count: 0, dir_count: 0 });
 
   function pushStatus(message: string) {
     setStatus(message);
     setStatusLog((previous) => [message, ...previous].slice(0, 8));
+  }
+
+  async function checkRuntimeHealth() {
+    const response = await fetch(`${API_BASE}/api/health`);
+    const payload = await response.json();
+    if (!response.ok || !payload.api_ok) {
+      throw new Error(payload.detail || "Backend health check failed.");
+    }
+    if (!payload.ok) {
+      const missing = Object.entries(payload.tools || {})
+        .filter(([, value]) => !(value as { ok?: boolean }).ok)
+        .map(([name]) => name);
+      throw new Error(`Environment is missing: ${missing.join(", ")}`);
+    }
+    pushStatus("Environment ready.");
+  }
+
+  async function waitForJob<T>(initialJob: JobPayload<T>, description: string): Promise<T> {
+    let job = initialJob;
+    while (job.status === "queued" || job.status === "running") {
+      pushStatus(`${description}: ${job.status}...`);
+      await new Promise((resolve) => window.setTimeout(resolve, 1000));
+      const response = await fetch(`${API_BASE}/api/jobs/${encodeURIComponent(job.job_id)}`);
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.detail || `Could not read job ${job.job_id}.`);
+      }
+      job = payload;
+    }
+    if (job.status === "completed" && job.result) {
+      return job.result;
+    }
+    throw new Error(job.message || `${description} did not complete.`);
   }
 
   async function refreshDatabases() {
@@ -413,9 +741,15 @@ function App() {
   }
 
   useEffect(() => {
-    refreshDatabases().catch(() => pushStatus("Backend is not reachable."));
-    refreshResults().catch(() => pushStatus("Result list is not reachable."));
-    refreshUploadStats().catch(() => pushStatus("Upload stats are not reachable."));
+    checkRuntimeHealth()
+      .then(() => Promise.all([
+        refreshDatabases(),
+        refreshResults(),
+        refreshUploadStats(),
+      ]))
+      .catch((error) => pushStatus(
+        error instanceof Error ? error.message : "Backend is not reachable."
+      ));
   }, []);
 
   const currentDb = databases.find((db) => db.name === selectedDb);
@@ -425,37 +759,66 @@ function App() {
     if (!queries.length) return null;
     return queries.find((query) => query.query_id === selectedSiteQueryId) || queries[queries.length - 1];
   }, [result, selectedSiteQueryId]);
-  const selectedSiteQueryRows = selectedSiteQuery?.rows || result?.site_query || [];
+  const selectedSiteQueryRows = useMemo(
+    () => sortByBiologicalPosition(
+      selectedSiteQuery?.rows || result?.site_query || [],
+    ),
+    [selectedSiteQuery?.rows, result?.site_query],
+  );
+  const selectedScanSummaryRows = scanSummaryRows(selectedSiteQuery?.scan_summary);
+  const selectedNoCallRegions = selectedSiteQuery?.no_call_regions || [];
+  const selectedCompleteRows = selectedSiteQuery?.complete_rows || [];
+  const selectedAminoAcidRows = aminoAcidDetailRows(selectedSiteQueryRows);
+  const selectedCoverageRegions = (result?.coverage_regions || []).filter(
+    (row) => row["Gene symbol"] === coverageGene,
+  );
+
+  useEffect(() => {
+    if (active === "coverage" && result?.run_id && coverageGene) {
+      loadCoverageGene(result.run_id, coverageGene);
+    }
+  }, [active, result?.run_id, coverageGene]);
 
   function setLoadedResult(payload: ResultPayload) {
     setResult(payload);
     setSelectedResultId(payload.run_id);
     const queries = payload.site_queries || [];
     setSelectedSiteQueryId(queries[queries.length - 1]?.query_id || "");
+    const coverageGenes = payload.coverage_summary || [];
+    setCoverageGene((previous) => (
+      coverageGenes.some((row) => row["Gene symbol"] === previous)
+        ? previous
+        : coverageGenes[0]?.["Gene symbol"] || ""
+    ));
+    setCoveragePoints(null);
   }
 
   async function submitDatabase(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    pushStatus("Uploading reference and annotation files...");
-    const form = new FormData(event.currentTarget);
-    pushStatus("Building gene database...");
-    const response = await fetch(`${API_BASE}/api/databases`, { method: "POST", body: form });
-    const payload = await response.json();
-    if (!response.ok) {
-      pushStatus(payload.detail || "Database build failed.");
-      return;
+    try {
+      pushStatus("Uploading reference and annotation files...");
+      const form = new FormData(event.currentTarget);
+      const response = await fetch(`${API_BASE}/api/databases`, { method: "POST", body: form });
+      const job = await response.json();
+      if (!response.ok) {
+        pushStatus(job.detail || "Database build failed.");
+        return;
+      }
+      const payload = await waitForJob<Database & { name: string }>(job, "Building gene database");
+      const builtDb: Database = {
+        name: payload.name,
+        gene_count: payload.gene_count || payload.genes?.length || 0,
+        warning_count: payload.warning_count || 0,
+        genes: payload.genes || [],
+      };
+      setDatabases((previous) => [builtDb, ...previous.filter((db) => db.name !== builtDb.name)]);
+      setSelectedDb(payload.name);
+      setSelectedGene(payload.genes?.[0]?.symbol || "");
+      pushStatus(`Database built: ${payload.name} (${builtDb.gene_count} genes).`);
+      await refreshDatabases();
+    } catch (error) {
+      pushStatus(error instanceof Error ? error.message : "Database build failed.");
     }
-    const builtDb: Database = {
-      name: payload.name,
-      gene_count: payload.gene_count || payload.genes?.length || 0,
-      warning_count: payload.warning_count || 0,
-      genes: payload.genes || [],
-    };
-    setDatabases((previous) => [builtDb, ...previous.filter((db) => db.name !== builtDb.name)]);
-    setSelectedDb(payload.name);
-    setSelectedGene(payload.genes?.[0]?.symbol || "");
-    pushStatus(`Database built: ${payload.name} (${builtDb.gene_count} genes).`);
-    await refreshDatabases();
   }
 
   async function submitAnalysis(event: React.FormEvent<HTMLFormElement>) {
@@ -469,19 +832,23 @@ function App() {
       pushStatus("Select exactly one input: FASTQ or BAM.");
       return;
     }
-    pushStatus("Uploading sample file...");
-    const form = new FormData(formElement);
-    pushStatus("Running sample analysis...");
-    const response = await fetch(`${API_BASE}/api/analyze`, { method: "POST", body: form });
-    const payload = await response.json();
-    if (!response.ok) {
-      pushStatus(payload.detail || "Sample analysis failed.");
-      return;
+    try {
+      pushStatus("Uploading sample file...");
+      const form = new FormData(formElement);
+      const response = await fetch(`${API_BASE}/api/analyze`, { method: "POST", body: form });
+      const job = await response.json();
+      if (!response.ok) {
+        pushStatus(job.detail || "Sample analysis failed.");
+        return;
+      }
+      const payload = await waitForJob<ResultPayload>(job, "Running sample analysis");
+      setLoadedResult(payload);
+      await refreshResults(payload.run_id);
+      pushStatus(`Analysis complete: ${payload.run_id}`);
+      setActive("results");
+    } catch (error) {
+      pushStatus(error instanceof Error ? error.message : "Sample analysis failed.");
     }
-    setLoadedResult(payload);
-    await refreshResults(payload.run_id);
-    pushStatus(`Analysis complete: ${payload.run_id}`);
-    setActive("results");
   }
 
   async function clearSampleUploads() {
@@ -507,17 +874,69 @@ function App() {
 
   async function submitSiteQuery(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const form = new FormData(event.currentTarget);
-    pushStatus("Querying selected sites from analysis BAM...");
-    const response = await fetch(`${API_BASE}/api/site-query`, { method: "POST", body: form });
-    const payload = await response.json();
-    if (!response.ok) {
-      pushStatus(payload.detail || "Site query failed.");
+    try {
+      const form = new FormData(event.currentTarget);
+      const wholeGene = form.get("query_type") === "gene_region";
+      pushStatus(wholeGene ? "Starting whole-gene scan..." : "Starting site query...");
+      const response = await fetch(`${API_BASE}/api/site-query`, { method: "POST", body: form });
+      const job = await response.json();
+      if (!response.ok) {
+        pushStatus(job.detail || "Site query failed.");
+        return;
+      }
+      const payload = await waitForJob<SiteQueryPayload>(
+        job,
+        wholeGene ? "Scanning complete gene interval" : "Querying selected sites",
+      );
+      await loadResult(payload.run_id);
+      pushStatus(
+        `${wholeGene ? "Whole-gene scan" : "Site query"} complete: `
+        + `${payload.run_id} / ${payload.gene || payload.query_id}`,
+      );
+      setActive("results");
+    } catch (error) {
+      pushStatus(error instanceof Error ? error.message : "Site query failed.");
+    }
+  }
+
+  async function submitCoverage(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    try {
+      const form = new FormData(event.currentTarget);
+      pushStatus("Generating gene and region coverage...");
+      const response = await fetch(`${API_BASE}/api/coverage`, { method: "POST", body: form });
+      const job = await response.json();
+      if (!response.ok) {
+        pushStatus(job.detail || "Coverage generation failed.");
+        return;
+      }
+      const payload = await waitForJob<CoveragePayload>(job, "Calculating coverage");
+      await loadResult(payload.run_id);
+      const firstGene = payload.coverage_summary?.[0]?.["Gene symbol"] || "";
+      if (firstGene) await loadCoverageGene(payload.run_id, firstGene);
+      pushStatus(`Coverage ready: ${payload.run_id}`);
+    } catch (error) {
+      pushStatus(error instanceof Error ? error.message : "Coverage generation failed.");
+    }
+  }
+
+  async function loadCoverageGene(runId: string, gene: string) {
+    setCoverageGene(gene);
+    if (!runId || !gene) {
+      setCoveragePoints(null);
       return;
     }
-    await loadResult(payload.run_id);
-    pushStatus(`Site query complete: ${payload.run_id} / ${payload.gene || payload.query_id}`);
-    setActive("results");
+    const response = await fetch(
+      `${API_BASE}/api/results/${encodeURIComponent(runId)}/coverage/${encodeURIComponent(gene)}`,
+    );
+    const payload = await response.json();
+    if (!response.ok) {
+      setCoveragePoints(null);
+      pushStatus(payload.detail || `Could not load coverage for ${gene}.`);
+      return;
+    }
+    setCoveragePoints(payload);
+    pushStatus(`Coverage loaded: ${gene}`);
   }
 
   async function refreshResults(preferredRunId = selectedResultId) {
@@ -531,8 +950,7 @@ function App() {
       : nextResults[nextResults.length - 1]?.run_id || "";
     if (nextSelection) {
       setSelectedResultId(nextSelection);
-      const selected = nextResults.find((run: ResultPayload) => run.run_id === nextSelection);
-      if (selected) setLoadedResult(selected);
+      await loadResult(nextSelection);
     } else {
       setSelectedResultId("");
       setSelectedSiteQueryId("");
@@ -567,6 +985,19 @@ function App() {
     pushStatus(`HTML report requested: ${result.run_id}`);
   }
 
+  function downloadCompleteGeneTable() {
+    if (!result?.run_id || !selectedSiteQuery?.query_id || !selectedSiteQuery.complete_table) {
+      pushStatus("No complete whole-gene table is available.");
+      return;
+    }
+    window.open(
+      `${API_BASE}/api/results/${encodeURIComponent(result.run_id)}`
+      + `/site-query/${encodeURIComponent(selectedSiteQuery.query_id)}/complete-table`,
+      "_blank",
+    );
+    pushStatus(`Complete gene table requested: ${selectedSiteQuery.query_id}`);
+  }
+
   async function refreshUploadStats() {
     const response = await fetch(`${API_BASE}/api/uploads/samples`);
     const payload = await response.json();
@@ -583,13 +1014,14 @@ function App() {
       <aside className="sidebar">
         <div>
           <h1>Mutation Patrol Robot</h1>
-          <p>AMR gene database, sample analysis, and site inspection.</p>
+          <p>Configurable gene database, mutation browsing, and coverage inspection.</p>
         </div>
         <nav>
           {[
             ["database", "Gene Database"],
             ["analysis", "Sample Analysis"],
-            ["query", "Site Query"],
+            ["query", "Whole Gene Scan"],
+            ["coverage", "Coverage"],
             ["results", "Results"],
           ].map(([id, label]) => (
             <button className={active === id ? "active" : ""} key={id} onClick={() => setActive(id)}>
@@ -693,6 +1125,9 @@ function App() {
               <Field label="Minimum alt count">
                 <input name="min_alt_count" type="number" min="0" defaultValue="1" />
               </Field>
+              <Field label="Minimum base quality">
+                <input name="min_baseq" type="number" min="0" max="93" defaultValue="20" />
+              </Field>
               <Field label="Minimum alt frequency">
                 <input name="min_alt_freq" type="number" min="0" max="1" step="0.01" defaultValue="0.05" />
               </Field>
@@ -704,7 +1139,13 @@ function App() {
 
         {active === "query" && (
           <section className="panel">
-            <h2>Site Query</h2>
+            <h2>Whole Gene Scan / Site Query</h2>
+            <div className="infoBox">
+              Whole Gene Scan examines the complete annotated genomic interval
+              of the selected gene and reports supported SNV/indel rows plus
+              NO_CALL region summaries. MIXED_SIGNAL describes multiple
+              supported alleles only; it does not diagnose mixed infection.
+            </div>
             <form onSubmit={submitSiteQuery} className="gridForm">
               <Field label="Analysis run">
                 <select name="analysis_run" required>
@@ -725,25 +1166,140 @@ function App() {
                 </select>
               </Field>
               <Field label="Position type">
-                <select name="query_type" defaultValue="aa_pos">
+                <select
+                  name="query_type"
+                  value={siteQueryType}
+                  onChange={(event) => setSiteQueryType(event.target.value)}
+                >
+                  <option value="gene_region">Whole annotated gene</option>
                   <option value="genomic_pos">Genome coordinate</option>
                   <option value="cds_pos">CDS nucleotide</option>
                   <option value="aa_pos">Amino acid</option>
                 </select>
               </Field>
               <Field label="Positions">
-                <input name="query_value" required placeholder="436,437,540,581" />
+                <input
+                  name="query_value"
+                  required={siteQueryType !== "gene_region"}
+                  disabled={siteQueryType === "gene_region"}
+                  placeholder={
+                    siteQueryType === "gene_region"
+                      ? "Not required for whole-gene scan"
+                      : "436,437,540,581"
+                  }
+                />
               </Field>
               <Field label="Allele">
-                <input name="alt" placeholder="optional; base, codon, or AA" />
+                <input
+                  name="alt"
+                  disabled={siteQueryType === "gene_region"}
+                  placeholder={
+                    siteQueryType === "gene_region"
+                      ? "All supported variants will be reported"
+                      : "optional; base, codon, or AA"
+                  }
+                />
               </Field>
               <Field label="Minimum alt frequency">
                 <input name="min_alt_freq" type="number" min="0" max="1" step="0.01" defaultValue="0.05" />
               </Field>
+              <Field label="Minimum depth for a call">
+                <input name="min_depth" type="number" min="1" step="1" defaultValue="10" />
+              </Field>
+              <Field label="Minimum mapping quality">
+                <input name="min_mapq" type="number" min="0" max="255" step="1" defaultValue="20" />
+              </Field>
+              <Field label="Minimum base quality">
+                <input name="min_baseq" type="number" min="0" max="93" step="1" defaultValue="20" />
+              </Field>
+              <Field label="Minimum allele support">
+                <input name="min_allele_count" type="number" min="1" step="1" defaultValue="2" />
+              </Field>
               <input type="hidden" name="force" value="true" />
               <button type="button" onClick={() => refreshResults()}>Refresh Runs</button>
-              <button className="primary" type="submit">Query Sites</button>
+              <button className="primary" type="submit">
+                {siteQueryType === "gene_region" ? "Scan Whole Gene" : "Query Sites"}
+              </button>
             </form>
+          </section>
+        )}
+
+        {active === "coverage" && (
+          <section className="panel">
+            <div className="panelHeader">
+              <h2>Gene / Amplicon Coverage</h2>
+              <button type="button" onClick={() => refreshResults()}>Refresh Runs</button>
+            </div>
+            <div className="infoBox">
+              This page displays observed read depth and callable positions only.
+              It does not calculate or infer CNV. When explicit amplicon regions
+              are not present in the database, exon/target regions are shown.
+            </div>
+            <form onSubmit={submitCoverage} className="gridForm">
+              <Field label="Analysis run">
+                <select
+                  name="analysis_run"
+                  value={selectedResultId}
+                  onChange={(event) => loadResult(event.target.value)}
+                  required
+                >
+                  <option value="">Select completed analysis</option>
+                  {results.map((run) => (
+                    <option key={run.run_id} value={run.run_id}>{run.run_id}</option>
+                  ))}
+                </select>
+              </Field>
+              <Field label="Gene database">
+                <select
+                  name="db_name"
+                  value={selectedDb}
+                  onChange={(event) => setSelectedDb(event.target.value)}
+                  required
+                >
+                  <option value="">Select database</option>
+                  {databases.map((db) => <option key={db.name}>{db.name}</option>)}
+                </select>
+              </Field>
+              <Field label="Minimum call depth">
+                <input name="minimum_call_depth" type="number" min="1" defaultValue="10" />
+              </Field>
+              <Field label="Minimum mapping quality">
+                <input name="min_mapq" type="number" min="0" max="255" defaultValue="20" />
+              </Field>
+              <Field label="Minimum base quality">
+                <input name="min_baseq" type="number" min="0" max="93" defaultValue="20" />
+              </Field>
+              <input type="hidden" name="force" value="true" />
+              <button className="primary" type="submit">Generate Coverage</button>
+            </form>
+
+            <h3>Gene Coverage Summary</h3>
+            <PaginatedSortableTable
+              rows={result?.coverage_summary || []}
+              empty="No coverage is available. Select a run and generate coverage."
+            />
+
+            <div className="sectionHeader">
+              <h3>Position Coverage</h3>
+              <select
+                value={coverageGene}
+                onChange={(event) => setCoverageGene(event.target.value)}
+              >
+                <option value="">Select gene</option>
+                {(result?.coverage_summary || []).map((row) => (
+                  <option key={row["Gene symbol"]} value={row["Gene symbol"]}>
+                    {row["Gene name"] || row["Gene symbol"]}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <CoverageChart payload={coveragePoints} />
+
+            <h3>Amplicon / Target-region Coverage</h3>
+            <PaginatedSortableTable
+              rows={selectedCoverageRegions}
+              empty="No amplicon or target-region coverage is available for this gene."
+            />
           </section>
         )}
 
@@ -782,7 +1338,7 @@ function App() {
             <h3>Mutation Candidates</h3>
             <PaginatedSortableTable rows={result?.mutation_candidates || []} empty="No mutation candidates loaded." />
             <div className="sectionHeader">
-              <h3>Site Query Charts</h3>
+              <h3>Gene Scan / Site Query</h3>
               <select
                 value={selectedSiteQuery?.query_id || ""}
                 onChange={(event) => setSelectedSiteQueryId(event.target.value)}
@@ -793,9 +1349,50 @@ function App() {
                 ))}
               </select>
             </div>
+            {selectedScanSummaryRows.length > 0 && (
+              <>
+                <h3>Whole Gene Scan Summary</h3>
+                <DataTable
+                  rows={selectedScanSummaryRows}
+                  empty="No whole-gene scan summary loaded."
+                />
+                <h3>NO_CALL Regions</h3>
+                <PaginatedSortableTable
+                  rows={selectedNoCallRegions}
+                  empty="No NO_CALL regions were found."
+                />
+              </>
+            )}
             <SiteQueryCharts rows={selectedSiteQueryRows} />
-            <h3>Site Query</h3>
-            <DataTable rows={selectedSiteQueryRows} empty="No site query loaded." />
+            <h3>Detected Variant Alleles</h3>
+            <PaginatedSortableTable
+              rows={selectedSiteQueryRows}
+              empty="No supported variants were detected for this query."
+            />
+            <h3>Coding and Amino-acid Details</h3>
+            <PaginatedSortableTable
+              rows={selectedAminoAcidRows}
+              empty="No coding-region amino-acid changes were detected."
+            />
+            {selectedSiteQuery?.complete_table && (
+              <>
+                <div className="sectionHeader">
+                  <h3>Complete Gene Table</h3>
+                  <button type="button" onClick={downloadCompleteGeneTable}>
+                    Export Complete CSV
+                  </button>
+                </div>
+                <div className="infoBox">
+                  The preview shows up to 1,000 rows. Export Complete CSV
+                  contains every genomic position and all reported allele rows,
+                  including REFERENCE, VARIANT, MIXED_SIGNAL, and NO_CALL.
+                </div>
+                <PaginatedSortableTable
+                  rows={selectedCompleteRows}
+                  empty="No complete gene table preview is available."
+                />
+              </>
+            )}
           </section>
         )}
       </section>

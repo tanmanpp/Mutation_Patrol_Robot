@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from modules.utils import ensure_dir, run_cmd
+from modules.utils import ensure_dir, run_bash_pipeline
 
 
 def _find_fastq_files(raw_dir: Path):
@@ -61,15 +61,18 @@ def map_reads_to_ref(raw_dir: Path,
         logger.info(f"BAM exists, skip: {bam_out}")
         return bam_out
 
-    read_inputs = " ".join(str(p) for p in fq_files)
-    cmd = [
-        "bash", "-lc",
-        (
-            f"minimap2 -t {threads} -a -x map-ont {ref_fasta} {read_inputs} "
-            f"| samtools view -b -q {min_mapq} - "
-            f"| samtools sort -@ {threads} -o {bam_out} - && "
-            f"samtools index {bam_out}"
-        )
+    commands = [
+        [
+            "minimap2", "-t", str(threads), "-a", "-x", "map-ont",
+            str(ref_fasta), *[str(path) for path in fq_files],
+        ],
+        ["samtools", "view", "-b", "-q", str(min_mapq), "-"],
+        ["samtools", "sort", "-@", str(threads), "-o", str(bam_out), "-"],
     ]
-    run_cmd(cmd, logger=logger, dry_run=dry_run)
+    run_bash_pipeline(
+        commands,
+        then=[["samtools", "index", str(bam_out)]],
+        logger=logger,
+        dry_run=dry_run,
+    )
     return bam_out

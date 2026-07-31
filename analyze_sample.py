@@ -6,6 +6,7 @@ from pathlib import Path
 
 from modules.annotate_mut import variants_to_aa_table
 from modules.bam_allele_freq import mutation_candidates_from_bam
+from modules.coverage import generate_coverage_tables
 from modules.gene_database import load_gene_database
 from modules.mapping import map_reads_to_ref
 from modules.report import write_tables
@@ -16,7 +17,7 @@ from modules.variant_call import call_variants_per_gene
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Analyze one sequencing sample against a prebuilt AMR gene database.",
+        description="Analyze one sequencing sample against a prebuilt user-defined gene database.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--gene_db", required=True, help="gene_database.json from build_gene_db.py")
@@ -27,6 +28,7 @@ def build_parser():
     parser.add_argument("--ref_fasta", default=None, help="Reference FASTA. Defaults to value stored in gene_db.")
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--min_mapq", type=int, default=20)
+    parser.add_argument("--min_baseq", type=int, default=20)
     parser.add_argument("--min_depth", type=int, default=10)
     parser.add_argument("--min_alt_count", type=int, default=1)
     parser.add_argument("--min_alt_freq", type=float, default=0.05)
@@ -113,6 +115,7 @@ def main():
             min_alt_count=args.min_alt_count,
             min_alt_freq=args.min_alt_freq,
             min_mapq=args.min_mapq,
+            min_baseq=args.min_baseq,
             dry_run=args.dry_run,
             force=args.force,
             logger=logger,
@@ -151,9 +154,25 @@ def main():
             "gene_db": str(gene_db_path),
             "gene_count": gene_db["gene_count"],
             "candidate_source": args.candidate_source,
+            "min_depth": args.min_depth,
+            "min_mapq": args.min_mapq,
+            "min_baseq": args.min_baseq,
+            "min_alt_count": args.min_alt_count,
+            "min_alt_freq": args.min_alt_freq,
         },
         logger=logger,
     )
+    if not args.dry_run:
+        generate_coverage_tables(
+            gene_db_path=gene_db_path,
+            bam_path=bam_path,
+            out_dir=out_dir / "coverage",
+            minimum_call_depth=max(1, args.min_depth),
+            min_mapq=args.min_mapq,
+            min_baseq=args.min_baseq,
+            force=args.force,
+            logger=logger,
+        )
     logger.info("Sample analysis complete.")
 
 

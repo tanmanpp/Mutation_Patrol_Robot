@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 import json
+import shlex
 import subprocess
 from pathlib import Path
 from datetime import datetime
@@ -62,7 +63,7 @@ def setup_logger(log_path: Path):
     return SimpleLogger()
 
 
-def run_cmd(cmd, logger, dry_run=False, cwd=None):
+def run_cmd(cmd, logger, dry_run=False, cwd=None, capture_output=False):
     if isinstance(cmd, (list, tuple)):
         printable = " ".join(map(str, cmd))
     else:
@@ -73,11 +74,40 @@ def run_cmd(cmd, logger, dry_run=False, cwd=None):
         return 0
 
     try:
-        subprocess.run(cmd, check=True, cwd=cwd)
-        return 0
+        completed = subprocess.run(
+            cmd,
+            check=True,
+            cwd=cwd,
+            capture_output=capture_output,
+            text=capture_output,
+        )
+        return completed if capture_output else 0
     except subprocess.CalledProcessError as e:
+        if capture_output and e.stdout:
+            logger.error(e.stdout.strip())
+        if capture_output and e.stderr:
+            logger.error(e.stderr.strip())
         logger.error(f"Command failed with exit code {e.returncode}")
         raise
+
+
+def run_bash_pipeline(commands, logger, dry_run=False, cwd=None, then=None):
+    """Run a pipeline while safely quoting every individual command argument."""
+    pipeline = " | ".join(
+        shlex.join([str(item) for item in command])
+        for command in commands
+    )
+    if then:
+        pipeline += " && " + " && ".join(
+            shlex.join([str(item) for item in command])
+            for command in then
+        )
+    return run_cmd(
+        ["bash", "-lc", pipeline],
+        logger=logger,
+        dry_run=dry_run,
+        cwd=cwd,
+    )
 
 
 def write_run_metadata(out_json: Path, args):

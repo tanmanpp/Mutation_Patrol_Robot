@@ -1,38 +1,41 @@
 # -*- coding: utf-8 -*-
 
 import csv
-import subprocess
 from pathlib import Path
 
 from modules.annotate_mut import FIELDNAMES, annotate_candidate_row
+from modules.bam_utils import ensure_bam_index
 from modules.gene_database import load_gene_database
-from modules.utils import ensure_dir
+from modules.utils import ensure_dir, run_cmd
 
 
 BASES = ("A", "C", "G", "T")
 
 
-def ensure_bam_index(bam_path: Path, logger):
-    bai_candidates = [
-        Path(str(bam_path) + ".bai"),
-        bam_path.with_suffix(".bai"),
-    ]
-    if any(path.exists() for path in bai_candidates):
-        return
+def _format_allele_spectrum(counts: dict[str, int], depth: int):
+    observed = sorted(
+        ((allele, count) for allele, count in counts.items() if count > 0),
+        key=lambda item: (-item[1], item[0]),
+    )
+    return "; ".join(
+        f"{allele}:{count} ({count / depth:.1%})"
+        for allele, count in observed
+    ) if depth else ""
 
-    cmd = ["bash", "-lc", f"samtools index {bam_path}"]
-    logger.info(f"CMD: {' '.join(map(str, cmd))}")
-    try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-    except subprocess.CalledProcessError as exc:
-        if exc.stdout:
-            logger.error(exc.stdout.strip())
-        if exc.stderr:
-            logger.error(exc.stderr.strip())
-        raise RuntimeError(
-            "samtools index failed. Make sure the BAM is coordinate-sorted "
-            "and was produced against the same reference genome."
-        ) from exc
+
+def _candidate_call_status(counts: dict[str, int],
+                           depth: int,
+                           min_allele_count: int,
+                           min_allele_freq: float):
+    qualifying = [
+        allele
+        for allele, count in counts.items()
+        if count > 0
+        and count >= min_allele_count
+        and depth
+        and count / depth >= min_allele_freq
+    ]
+    return "MIXED_SIGNAL" if len(qualifying) >= 2 else "VARIANT"
 
 
 def _count_pileup_bases(read_bases: str, ref_base: str):
@@ -41,6 +44,10 @@ def _count_pileup_bases(read_bases: str, ref_base: str):
 
 def _count_pileup_events(read_bases: str, ref_base: str):
     counts = {base: 0 for base in BASES}
+    strand_counts = {
+        base: {"forward": 0, "reverse": 0}
+        for base in BASES
+    }
     insertions = {}
     deletions = {}
     i = 0
@@ -73,16 +80,21 @@ def _count_pileup_events(read_bases: str, ref_base: str):
             ref = ref_base.upper()
             if ref in counts:
                 counts[ref] += 1
+                strand = "forward" if char == "." else "reverse"
+                strand_counts[ref][strand] += 1
             i += 1
             continue
 
         base = char.upper()
         if base in counts:
             counts[base] += 1
+            strand = "forward" if char.isupper() else "reverse"
+            strand_counts[base][strand] += 1
         i += 1
 
     return {
         "bases": counts,
+        "strand_counts": strand_counts,
         "insertions": insertions,
         "deletions": deletions,
     }
@@ -94,20 +106,21 @@ def _run_mpileup(bam_path: Path,
                  start: int,
                  end: int,
                  min_mapq: int,
-                 logger):
+                 logger,
+                 min_baseq: int = 20):
     region = f"{chrom}:{start}-{end}"
-    cmd = [
-        "bash", "-lc",
-        f"samtools mpileup -aa -q {min_mapq} -f {ref_fasta} -r {region} {bam_path}"
-    ]
-    logger.info(f"CMD: {' '.join(map(str, cmd))}")
     try:
-        completed = subprocess.run(cmd, check=True, capture_output=True, text=True)
-    except subprocess.CalledProcessError as exc:
-        if exc.stdout:
-            logger.error(exc.stdout.strip())
-        if exc.stderr:
-            logger.error(exc.stderr.strip())
+        completed = run_cmd(
+            [
+                "samtools", "mpileup", "-aa", "-q", str(min_mapq),
+                "-Q", str(min_baseq),
+                "-d", "1000000",
+                "-f", str(ref_fasta), "-r", region, str(bam_path),
+            ],
+            logger=logger,
+            capture_output=True,
+        )
+    except Exception as exc:
         raise RuntimeError(
             "samtools mpileup failed. Check that the BAM has an index, "
             "the queried contig exists in the BAM, and the BAM/reference use matching IDs."
@@ -121,7 +134,9 @@ def _candidate_rows_from_pileup(gene: str,
                                 gene_db: dict,
                                 min_depth: int,
                                 min_alt_count: int,
-                                min_alt_freq: float):
+                                min_alt_freq: float,
+                                min_mapq: int,
+                                min_baseq: int):
     rows = []
     for line in pileup_lines:
         parts = line.rstrip("\n").split("\t")
@@ -131,12 +146,18 @@ def _candidate_rows_from_pileup(gene: str,
         chrom, pos, ref_base, raw_depth, read_bases = parts[:5]
         events = _count_pileup_events(read_bases, ref_base)
         counts = events["bases"]
+        strand_counts = events["strand_counts"]
         counted_depth = sum(counts.values())
         if counted_depth < min_depth:
             continue
 
         ref = ref_base.upper()
         ref_depth = counts.get(ref, 0)
+        call_status = _candidate_call_status(
+            counts, counted_depth, min_alt_count, min_alt_freq
+        )
+        spectrum = _format_allele_spectrum(counts, counted_depth)
+        allele_count = sum(1 for count in counts.values() if count > 0)
         for alt in BASES:
             if alt == ref:
                 continue
@@ -158,9 +179,24 @@ def _candidate_rows_from_pileup(gene: str,
                 "qual": "",
                 "filter": "PASS",
                 "depth": counted_depth,
+                "raw_depth": raw_depth,
                 "ref_depth": ref_depth,
                 "alt_depth": alt_depth,
+                "forward_depth": strand_counts[alt]["forward"],
+                "reverse_depth": strand_counts[alt]["reverse"],
                 "allele_freq": f"{allele_freq:.6f}",
+                "allele_count": allele_count,
+                "allele_spectrum": spectrum,
+                "call_status": call_status,
+                "allele_status": "OBSERVED",
+                "qc_flags": (
+                    "MULTIPLE_ALLELES"
+                    if call_status == "MIXED_SIGNAL" else "PASS"
+                ),
+                "min_depth": min_depth,
+                "min_mapq": min_mapq,
+                "min_baseq": min_baseq,
+                "min_allele_count": min_alt_count,
                 "variant_type": "SNV",
                 "source": "bam_pileup",
             }
@@ -173,6 +209,16 @@ def _candidate_rows_from_pileup(gene: str,
             if allele_freq < min_alt_freq:
                 continue
 
+            insertion_call_counts = {
+                ref: max(counted_depth - alt_depth, 0),
+                f"+{inserted_sequence}": alt_depth,
+            }
+            insertion_call_status = _candidate_call_status(
+                insertion_call_counts,
+                counted_depth,
+                min_alt_count,
+                min_alt_freq,
+            )
             row = {
                 "Gene name": gene_record.get("description") or gene,
                 "Gene symbol": gene,
@@ -184,9 +230,28 @@ def _candidate_rows_from_pileup(gene: str,
                 "qual": "",
                 "filter": "PASS",
                 "depth": counted_depth,
+                "raw_depth": raw_depth,
                 "ref_depth": ref_depth,
                 "alt_depth": alt_depth,
+                "forward_depth": "",
+                "reverse_depth": "",
                 "allele_freq": f"{allele_freq:.6f}",
+                "allele_count": sum(
+                    count > 0 for count in insertion_call_counts.values()
+                ),
+                "allele_spectrum": _format_allele_spectrum(
+                    insertion_call_counts, counted_depth
+                ),
+                "call_status": insertion_call_status,
+                "allele_status": "OBSERVED",
+                "qc_flags": (
+                    "MULTIPLE_ALLELES"
+                    if insertion_call_status == "MIXED_SIGNAL" else "PASS"
+                ),
+                "min_depth": min_depth,
+                "min_mapq": min_mapq,
+                "min_baseq": min_baseq,
+                "min_allele_count": min_alt_count,
                 "variant_type": "INS",
                 "source": "bam_pileup",
                 "note": f"insertion_sequence={inserted_sequence}",
@@ -205,7 +270,8 @@ def mutation_candidates_from_bam(gene_bams: dict,
                                  min_mapq: int,
                                  dry_run: bool,
                                  force: bool,
-                                 logger):
+                                 logger,
+                                 min_baseq: int = 20):
     ensure_dir(out_dir)
     out_csv = out_dir / "mutation_candidates.csv"
     if out_csv.exists() and not force:
@@ -240,6 +306,7 @@ def mutation_candidates_from_bam(gene_bams: dict,
                 end=end,
                 min_mapq=min_mapq,
                 logger=logger,
+                min_baseq=min_baseq,
             )
             rows.extend(_candidate_rows_from_pileup(
                 gene=gene,
@@ -249,6 +316,8 @@ def mutation_candidates_from_bam(gene_bams: dict,
                 min_depth=min_depth,
                 min_alt_count=min_alt_count,
                 min_alt_freq=min_alt_freq,
+                min_mapq=min_mapq,
+                min_baseq=min_baseq,
             ))
 
     with open(out_csv, "w", newline="", encoding="utf-8") as handle:

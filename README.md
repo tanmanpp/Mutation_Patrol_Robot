@@ -1,9 +1,11 @@
 # Mutation Patrol Robot
 
-Mutation Patrol Robot is a parasite AMR mutation screening project. The code is
-now split into two API-friendly Python operations:
+Mutation Patrol Robot is a configurable parasite gene mutation browser. It
+reports the variants and allele evidence observed at user-selected genes and
+positions; it does not infer drug resistance or recommend treatment. The code
+is split into two API-friendly Python operations:
 
-1. Build an AMR gene database from a reference genome.
+1. Build a user-defined gene database from a reference genome.
 2. Analyze sequencing samples against that database.
 
 The UI can later call these two operations separately instead of running one
@@ -78,9 +80,20 @@ start_mutation_patrol_robot.bat
 ```
 
 The batch file enters WSL, creates/uses a conda environment named
-`mutation_patrol`, builds the UI, and starts the app. You do not need to
-open a terminal or move to the project folder first; the batch file detects its
-own location.
+`mutation_patrol`, verifies every required runtime, builds the UI when needed,
+and starts the app. You do not need to open a terminal or move to the project
+folder first; the batch file detects its own location.
+
+At every launch the preflight checks:
+
+- Python 3.11 and the FastAPI backend packages
+- Node.js and npm
+- `samtools`, `bcftools`, and `minimap2`
+- whether `environment.yml` or the backend requirements changed
+
+The environment is created or synchronized automatically when necessary.
+Dependencies are not reinstalled on every launch when the environment is
+already current.
 
 You can also start the whole app manually inside WSL:
 
@@ -115,7 +128,7 @@ You can download it from:
 
 Recommended download flow:
 
-1. Search for the AMR gene of interest on the NCBI Datasets Gene page.
+1. Search for the target gene of interest on the NCBI Datasets Gene page.
 2. Open the gene result and use the download option.
 3. Download the **Product report** file in **JSON Lines / JSONL** format.
 4. Save the file as something descriptive, for example:
@@ -161,7 +174,7 @@ python build_gene_db.py \
   --force
 ```
 
-This step locates target AMR genes on the genome and exports:
+This step locates user-selected target genes on the genome and exports:
 
 - `gene_database.json`: structured database for API/UI/sample analysis
 - `gene_database.csv`: human-readable gene summary
@@ -212,7 +225,7 @@ python analyze_sample.py \
   --force
 ```
 
-Entrypoint from an existing sorted/indexed BAM:
+Entrypoint from an existing BAM:
 
 ```bash
 python analyze_sample.py \
@@ -244,6 +257,11 @@ a database CDS exon. The older VCF-based path is still available with
 `sample_summary.csv` includes one row per database gene and starts with the
 `Gene name` column for UI display.
 
+The web API copies an uploaded BAM to the analysis run's canonical
+`work/bam/merged.sorted.bam` location, coordinate-sorts it, and creates its BAM
+index automatically. The BAM must still use the same reference assembly and
+contig identifiers as the selected gene database.
+
 Export a final HTML report for one analysis output folder:
 
 ```bash
@@ -261,10 +279,53 @@ The HTML report includes the analysis summary, mutation candidates, all site
 query tables, and simple depth/frequency charts. In the web UI, use
 **Results > Export HTML Report** for the selected result.
 
-## Query User-Selected Sites
+## Scan a Whole Gene or Query Selected Sites
 
-Use `query_sites.py` when a user wants to inspect a specific position even if it
-does not appear in `mutation_candidates.csv`.
+The web UI defaults to **Whole Gene Scan**. It examines the complete annotated
+genomic interval from `gene_start` through `gene_end`, including intronic
+positions, and reports every supported SNV, insertion, deletion, and
+`MIXED_SIGNAL`. Reference-only positions are summarized rather than written as
+thousands of table rows. Low-depth and uncovered positions are compressed into
+`NO_CALL` regions so missing evidence remains visible.
+
+Command-line whole-gene scan:
+
+```bash
+python query_sites.py \
+  --gene_db databases/pf_amr_genes/gene_database.json \
+  --bam results/sample_01/work/bam/merged.sorted.bam \
+  --gene PF3D7_0810800 \
+  --whole_gene \
+  --min_depth 10 \
+  --min_alt_freq 0.05 \
+  --min_allele_count 2 \
+  --out_csv results/sample_01/site_query/gene_scan/site_query.csv \
+  --force
+```
+
+This writes:
+
+```text
+site_query.csv       supported variant allele rows
+complete_gene_table.csv
+                     every genomic position and reported allele row
+scan_summary.json    callable, variant, mixed-signal, and NO_CALL counts
+no_call_regions.csv  consecutive low-depth or uncovered intervals
+```
+
+The Results page previews the complete table and provides **Export Complete
+CSV** for the untruncated file. Coding rows include:
+
+- `region_type`: `CDS` or `NON_CODING`
+- `effect`: reference, synonymous, missense, stop gained/lost, in-frame
+  insertion/deletion, frameshift, non-coding variant, or no-call
+- CDS and codon position
+- reference and alternate codons
+- one-letter amino-acid codes and amino-acid names
+- formatted amino-acid change
+
+The original targeted mode remains available when a user wants to inspect a
+specific position even if it does not appear in the whole-gene scan.
 
 Query one genomic position:
 
@@ -317,22 +378,75 @@ python query_sites.py \
 ```
 
 The output uses the same columns as `mutation_candidates.csv`, including
-`ref_depth`, `alt_depth`, and `allele_freq`. Reference alleles are reported with
-`variant_type=REF`; queried but absent alleles are reported with `alt_depth=0`
-and `allele_freq=0.000000`. When `--alt` is not set, non-reference alleles are
-reported only when they pass `--min_alt_freq`, which defaults to `0.05`.
+`ref_depth`, `alt_depth`, strand depths, `allele_freq`, `allele_spectrum`,
+`call_status`, and QC thresholds. A position must reach `--min_depth` (default
+`10`) before it can be reported as `REFERENCE`, `VARIANT`, or `MIXED_SIGNAL`.
+Positions below that threshold are reported as `NO_CALL` (`無法判斷`) with
+`variant_type=NO_CALL`, never as a reference allele. `MIXED_SIGNAL` means that
+two or more alleles meet both `--min_alt_freq` and `--min_allele_count`; it is
+sequencing evidence and is not a diagnosis of mixed infection. Each row also
+uses `allele_status=OBSERVED` or `NOT_OBSERVED` for the requested allele.
+
+## Gene and Amplicon Coverage
+
+Every new sample analysis produces coverage tables under:
+
+```text
+app_data/results/<run>/coverage/
+```
+
+The web UI **Coverage** page displays gene summaries, exon/target-region
+summaries, and position-level depth charts. A database may optionally include
+explicit `amplicons` entries for a gene; otherwise its exon regions are shown.
+Coverage results include callable and `NO_CALL` base counts using the selected
+minimum depth. They do not estimate or infer CNV.
 
 ![Site query result](docs/site_query_result.png)
 
 ## Requirements
 
-The Python code uses only the standard library. The full sample workflow expects
-these command-line tools:
+The core analysis modules use the Python standard library. The web application
+also installs the packages listed in `backend/requirements.txt`. The full sample
+workflow expects these command-line tools:
 
 - `bash`
 - `minimap2`
 - `samtools`
 - `bcftools`
+
+The supported environment is described in `environment.yml`. Run a manual
+environment check after activating conda with:
+
+```bash
+python scripts/check_environment.py
+```
+
+## Background Jobs
+
+Database builds, sample analyses, site queries, and coverage regeneration run
+as background jobs.
+The API remains responsive while a job is queued or running, and the web UI
+polls the job status until it completes or fails. The default queue runs one
+bioinformatics job at a time to avoid competing for memory and CPU. Advanced
+users can change this with the `MPR_JOB_WORKERS` environment variable.
+
+## Development Checks
+
+Run the Python regression tests:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+Check and build the frontend:
+
+```bash
+cd frontend
+npm ci
+npm run build
+```
+
+GitHub Actions runs both checks for pushes and pull requests.
 
 ## Legacy Pipeline
 
