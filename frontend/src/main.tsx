@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Bar,
@@ -93,6 +93,28 @@ type CoveragePointPayload = {
   min_mapq: number;
   min_baseq: number;
   points: Record<string, string>[];
+};
+
+type IgvConfigPayload = {
+  run_id: string;
+  query_id: string;
+  database: string;
+  gene: string;
+  chrom: string;
+  strand: "+" | "-";
+  start: number;
+  end: number;
+  locus: string;
+  reference: {
+    name: string;
+    fasta_url: string;
+    index_url: string;
+  };
+  alignment: {
+    name: string;
+    bam_url: string;
+    index_url: string;
+  };
 };
 
 const FIELD_HELP: Record<string, string> = {
@@ -673,6 +695,114 @@ function CoverageChart({
   );
 }
 
+function apiResourceUrl(path: string) {
+  if (/^https?:\/\//i.test(path)) return path;
+  return `${API_BASE}${path}`;
+}
+
+function IgvViewer({
+  config,
+  onError,
+}: {
+  config: IgvConfigPayload;
+  onError: (message: string) => void;
+}) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    let browser: import("igv").Browser | null = null;
+    let igvModule: typeof import("igv") | null = null;
+
+    async function createViewer() {
+      if (!containerRef.current) return;
+      setLoading(true);
+      try {
+        igvModule = await import("igv");
+        const options = {
+          reference: {
+            id: config.database,
+            name: config.reference.name,
+            fastaURL: apiResourceUrl(config.reference.fasta_url),
+            indexURL: apiResourceUrl(config.reference.index_url),
+          },
+          locus: config.locus,
+          showNavigation: true,
+          tracks: [
+            {
+              name: "Reference sequence — three-frame translation",
+              type: "sequence",
+              frameTranslate: true,
+              reversed: config.strand === "-",
+              removable: false,
+            },
+            {
+              name: config.alignment.name,
+              type: "alignment",
+              format: "bam",
+              url: apiResourceUrl(config.alignment.bam_url),
+              indexURL: apiResourceUrl(config.alignment.index_url),
+              height: 500,
+              displayMode: "EXPANDED",
+            },
+          ],
+        } as unknown as import("igv").CreateOpt;
+        const created = await igvModule.default.createBrowser(
+          containerRef.current,
+          options,
+        );
+        if (cancelled) {
+          igvModule.default.removeBrowser(created);
+          return;
+        }
+        browser = created;
+        setLoading(false);
+      } catch (error) {
+        if (!cancelled) {
+          setLoading(false);
+          onError(
+            error instanceof Error
+              ? error.message
+              : "IGV could not be initialized.",
+          );
+        }
+      }
+    }
+
+    createViewer();
+    return () => {
+      cancelled = true;
+      if (browser && igvModule) {
+        igvModule.default.removeBrowser(browser);
+      }
+    };
+  }, [config, onError]);
+
+  return (
+    <section className="igvPanel" id="igv-viewer-panel">
+      <div className="sectionHeader">
+        <div>
+          <h3>IGV Genome Viewer</h3>
+          <p className="igvLocus">
+            {config.gene}: {config.locus}
+          </p>
+        </div>
+      </div>
+      <div className="infoBox">
+        Reference FASTA and the analysis BAM are loaded automatically. The
+        initial view is centered on the complete annotated gene interval.
+        Three-frame translation is enabled on the reference sequence track and
+        follows the annotated gene strand.
+        Alignment mismatches and indels are visual evidence and are not an
+        automatic clinical interpretation.
+      </div>
+      {loading && <div className="empty">Loading reference and alignments into IGV...</div>}
+      <div className="igvContainer" ref={containerRef} />
+    </section>
+  );
+}
+
 function App() {
   const [databases, setDatabases] = useState<Database[]>([]);
   const [selectedDb, setSelectedDb] = useState("");
@@ -687,12 +817,21 @@ function App() {
   const [siteQueryType, setSiteQueryType] = useState("gene_region");
   const [coverageGene, setCoverageGene] = useState("");
   const [coveragePoints, setCoveragePoints] = useState<CoveragePointPayload | null>(null);
+  const [igvConfig, setIgvConfig] = useState<IgvConfigPayload | null>(null);
+  const [igvLoading, setIgvLoading] = useState(false);
+  const [igvError, setIgvError] = useState("");
   const [uploadStats, setUploadStats] = useState<UploadStats>({ total_bytes: 0, file_count: 0, dir_count: 0 });
 
   function pushStatus(message: string) {
     setStatus(message);
     setStatusLog((previous) => [message, ...previous].slice(0, 8));
   }
+
+  const reportIgvError = React.useCallback((message: string) => {
+    setIgvError(message);
+    setStatus(`IGV error: ${message}`);
+    setStatusLog((previous) => [`IGV error: ${message}`, ...previous].slice(0, 8));
+  }, []);
 
   async function checkRuntimeHealth() {
     const response = await fetch(`${API_BASE}/api/health`);
@@ -778,6 +917,11 @@ function App() {
       loadCoverageGene(result.run_id, coverageGene);
     }
   }, [active, result?.run_id, coverageGene]);
+
+  useEffect(() => {
+    setIgvConfig(null);
+    setIgvError("");
+  }, [result?.run_id, selectedSiteQuery?.query_id]);
 
   function setLoadedResult(payload: ResultPayload) {
     setResult(payload);
@@ -996,6 +1140,39 @@ function App() {
       "_blank",
     );
     pushStatus(`Complete gene table requested: ${selectedSiteQuery.query_id}`);
+  }
+
+  async function openIgvViewer() {
+    if (!result?.run_id || !selectedSiteQuery?.query_id) {
+      pushStatus("Select a Whole Gene Scan result before opening IGV.");
+      return;
+    }
+    setIgvLoading(true);
+    setIgvError("");
+    try {
+      const response = await fetch(
+        `${API_BASE}/api/results/${encodeURIComponent(result.run_id)}`
+        + `/site-query/${encodeURIComponent(selectedSiteQuery.query_id)}/igv`,
+      );
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.detail || "IGV configuration could not be loaded.");
+      }
+      setIgvConfig(payload);
+      pushStatus(`IGV ready: ${payload.gene} / ${payload.locus}`);
+      window.setTimeout(() => {
+        document.getElementById("igv-viewer-panel")?.scrollIntoView({
+          behavior: "smooth",
+          block: "start",
+        });
+      }, 100);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "IGV could not be opened.";
+      setIgvError(message);
+      pushStatus(message);
+    } finally {
+      setIgvLoading(false);
+    }
   }
 
   async function refreshUploadStats() {
@@ -1339,16 +1516,35 @@ function App() {
             <PaginatedSortableTable rows={result?.mutation_candidates || []} empty="No mutation candidates loaded." />
             <div className="sectionHeader">
               <h3>Gene Scan / Site Query</h3>
-              <select
-                value={selectedSiteQuery?.query_id || ""}
-                onChange={(event) => setSelectedSiteQueryId(event.target.value)}
-              >
-                <option value="">Select site query</option>
-                {(result?.site_queries || []).map((query) => (
-                  <option key={query.query_id} value={query.query_id}>{siteQueryDisplayName(query)}</option>
-                ))}
-              </select>
+              <div className="sectionControls">
+                <select
+                  value={selectedSiteQuery?.query_id || ""}
+                  onChange={(event) => setSelectedSiteQueryId(event.target.value)}
+                >
+                  <option value="">Select site query</option>
+                  {(result?.site_queries || []).map((query) => (
+                    <option key={query.query_id} value={query.query_id}>{siteQueryDisplayName(query)}</option>
+                  ))}
+                </select>
+                {selectedSiteQuery?.scan_summary?.scan_type === "whole_gene" && (
+                  <button
+                    className="primary"
+                    type="button"
+                    onClick={openIgvViewer}
+                    disabled={igvLoading}
+                  >
+                    {igvLoading ? "Preparing IGV..." : "Open in IGV"}
+                  </button>
+                )}
+              </div>
             </div>
+            {igvError && <div className="errorBox">{igvError}</div>}
+            {igvConfig && (
+              <IgvViewer
+                config={igvConfig}
+                onError={reportIgvError}
+              />
+            )}
             {selectedScanSummaryRows.length > 0 && (
               <>
                 <h3>Whole Gene Scan Summary</h3>

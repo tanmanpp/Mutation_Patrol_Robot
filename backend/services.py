@@ -12,7 +12,12 @@ if TYPE_CHECKING:
     from fastapi import UploadFile
 
 from modules.bam_allele_freq import mutation_candidates_from_bam
-from modules.bam_utils import prepare_sorted_bam
+from modules.bam_utils import (
+    bam_index_candidates,
+    ensure_bam_index,
+    ensure_fasta_index,
+    prepare_sorted_bam,
+)
 from modules.coverage import generate_coverage_tables
 from modules.gene_database import build_gene_database_from_annotations, load_gene_database
 from modules.html_report import render_html_report
@@ -149,6 +154,8 @@ def build_database(name: str, ref_fasta: Path, annotations: list[Path], genes: l
     )
     for label, path in outputs.items():
         logger.info(f"{label}: {path}")
+    fasta_index = ensure_fasta_index(ref_fasta, logger=logger)
+    logger.info(f"reference_index: {fasta_index}")
 
     db_payload = load_gene_database(outputs["json"])
     return {
@@ -328,6 +335,10 @@ def query_sites(
     logger = setup_logger(out_dir / "query_sites.log")
     out_csv = out_dir / "site_query.csv"
     db_path = get_database_path(db_name)
+    gene_db = load_gene_database(db_path)
+    gene_record = gene_db.get("genes_by_symbol", {}).get(gene)
+    if not gene_record:
+        raise ValueError(f"Gene not found in database: {gene}")
     if query_type == "gene_region":
         scan_bam_gene_region(
             gene_db_path=db_path,
@@ -362,6 +373,25 @@ def query_sites(
             logger=logger,
             **kwargs,
         )
+    context = {
+        "query_type": query_type,
+        "database": safe_name(db_name),
+        "gene_database": relative_path(db_path),
+        "reference_fasta": gene_db.get("reference_fasta", ""),
+        "bam": relative_path(bam_path),
+        "gene": gene,
+        "chrom": (
+            gene_record.get("resolved_chrom")
+            or gene_record.get("chrom", "")
+        ),
+        "strand": gene_record.get("strand", "+"),
+        "start": int(gene_record["gene_start"]),
+        "end": int(gene_record["gene_end"]),
+    }
+    (out_dir / "igv_context.json").write_text(
+        json.dumps(context, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
     response = {
         "run_id": analysis_id,
         "query_id": query_id,
@@ -594,6 +624,177 @@ def get_complete_gene_table_path(run_id: str, query_id: str):
             f"Complete gene table not found: {run_id}/{query_id}"
         )
     return table_path
+
+
+def _load_igv_context(run_id: str, query_id: str):
+    result_dir = RESULTS_DIR / safe_name(run_id)
+    query_dir = result_dir / "site_query" / safe_name(query_id)
+    if not query_dir.exists():
+        raise FileNotFoundError(
+            f"Site query not found: {run_id}/{query_id}"
+        )
+
+    context_path = query_dir / "igv_context.json"
+    if context_path.exists():
+        context = json.loads(context_path.read_text(encoding="utf-8"))
+    else:
+        scan_path = query_dir / "scan_summary.json"
+        if not scan_path.exists():
+            raise FileNotFoundError(
+                "IGV is available for Whole Gene Scan results only."
+            )
+        scan = json.loads(scan_path.read_text(encoding="utf-8"))
+        run_summary_path = result_dir / "tables" / "summary.json"
+        run_summary = (
+            json.loads(run_summary_path.read_text(encoding="utf-8"))
+            if run_summary_path.exists() else {}
+        )
+        gene_db_path = (
+            (run_summary.get("extra") or {}).get("gene_db") or ""
+        )
+        context = {
+            "query_type": scan.get("scan_type", ""),
+            "gene_database": gene_db_path,
+            "gene": scan.get("gene", ""),
+            "chrom": scan.get("chrom", ""),
+            "start": scan.get("start", ""),
+            "end": scan.get("end", ""),
+            "bam": relative_path(
+                result_dir / "work" / "bam" / "merged.sorted.bam"
+            ),
+        }
+
+    if context.get("query_type") not in {"gene_region", "whole_gene"}:
+        raise ValueError(
+            "IGV is available for Whole Gene Scan results only."
+        )
+
+    db_value = context.get("gene_database") or ""
+    if not db_value:
+        raise FileNotFoundError(
+            "The gene database used for this scan could not be resolved."
+        )
+    db_path = resolve_project_path(db_value)
+    if not db_path.exists():
+        raise FileNotFoundError(f"Gene database not found: {db_path}")
+    gene_db = load_gene_database(db_path)
+
+    gene = str(context.get("gene") or "")
+    gene_record = gene_db.get("genes_by_symbol", {}).get(gene) or {}
+    chrom = str(
+        context.get("chrom")
+        or gene_record.get("resolved_chrom")
+        or gene_record.get("chrom")
+        or ""
+    )
+    start = int(context.get("start") or gene_record.get("gene_start") or 0)
+    end = int(context.get("end") or gene_record.get("gene_end") or 0)
+    strand = str(context.get("strand") or gene_record.get("strand") or "+")
+    if strand not in {"+", "-"}:
+        strand = "+"
+    if not chrom or start < 1 or end < start:
+        raise ValueError(
+            f"Invalid IGV locus for gene {gene}: {chrom}:{start}-{end}"
+        )
+
+    reference_value = (
+        context.get("reference_fasta")
+        or gene_db.get("reference_fasta")
+        or ""
+    )
+    reference_path = resolve_project_path(reference_value)
+    bam_path = resolve_project_path(
+        context.get("bam")
+        or relative_path(
+            result_dir / "work" / "bam" / "merged.sorted.bam"
+        )
+    )
+    if not reference_path.exists():
+        raise FileNotFoundError(
+            f"Reference FASTA not found: {reference_path}"
+        )
+    if not bam_path.exists():
+        raise FileNotFoundError(f"Analysis BAM not found: {bam_path}")
+
+    logger = setup_logger(query_dir / "igv.log")
+    reference_index = ensure_fasta_index(reference_path, logger=logger)
+    ensure_bam_index(bam_path, logger=logger)
+    bam_index = next(
+        (path for path in bam_index_candidates(bam_path) if path.exists()),
+        None,
+    )
+    if not reference_index.exists():
+        raise FileNotFoundError(
+            f"Reference FASTA index was not created: {reference_index}"
+        )
+    if bam_index is None:
+        raise FileNotFoundError(f"BAM index was not created: {bam_path}")
+
+    return {
+        "run_id": result_dir.name,
+        "query_id": query_dir.name,
+        "database": (
+            context.get("database")
+            or db_path.parent.name
+        ),
+        "gene": gene,
+        "chrom": chrom,
+        "strand": strand,
+        "start": start,
+        "end": end,
+        "reference": reference_path,
+        "reference_index": reference_index,
+        "bam": bam_path,
+        "bam_index": bam_index,
+    }
+
+
+def get_igv_config(run_id: str, query_id: str):
+    bundle = _load_igv_context(run_id, query_id)
+    base = (
+        f"/api/results/{bundle['run_id']}/site-query/"
+        f"{bundle['query_id']}/igv"
+    )
+    padding = max(50, min(500, (bundle["end"] - bundle["start"] + 1) // 20))
+    locus_start = max(1, bundle["start"] - padding)
+    locus_end = bundle["end"] + padding
+    return {
+        "run_id": bundle["run_id"],
+        "query_id": bundle["query_id"],
+        "database": bundle["database"],
+        "gene": bundle["gene"],
+        "chrom": bundle["chrom"],
+        "strand": bundle["strand"],
+        "start": bundle["start"],
+        "end": bundle["end"],
+        "locus": f"{bundle['chrom']}:{locus_start}-{locus_end}",
+        "reference": {
+            "name": bundle["database"],
+            "fasta_url": f"{base}/reference",
+            "index_url": f"{base}/reference-index",
+        },
+        "alignment": {
+            "name": f"{bundle['run_id']} alignments",
+            "bam_url": f"{base}/alignment",
+            "index_url": f"{base}/alignment-index",
+        },
+    }
+
+
+def get_igv_resource_path(run_id: str, query_id: str, resource: str):
+    bundle = _load_igv_context(run_id, query_id)
+    resources = {
+        "reference": (bundle["reference"], "text/plain"),
+        "reference-index": (bundle["reference_index"], "text/plain"),
+        "alignment": (bundle["bam"], "application/octet-stream"),
+        "alignment-index": (
+            bundle["bam_index"],
+            "application/octet-stream",
+        ),
+    }
+    if resource not in resources:
+        raise FileNotFoundError(f"Unknown IGV resource: {resource}")
+    return resources[resource]
 
 
 def list_results():

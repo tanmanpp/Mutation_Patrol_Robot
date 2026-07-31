@@ -13,7 +13,7 @@ from . import jobs, services
 from .config import PROJECT_ROOT
 
 
-app = FastAPI(title="Mutation Patrol Robot API", version="0.5.0")
+app = FastAPI(title="Mutation Patrol Robot API", version="0.6.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,6 +21,12 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=[
+        "Accept-Ranges",
+        "Content-Length",
+        "Content-Range",
+        "Content-Type",
+    ],
 )
 
 def has_upload(upload: UploadFile | None):
@@ -341,6 +347,31 @@ def complete_gene_table(run_id: str, query_id: str):
         )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/results/{run_id}/site-query/{query_id}/igv")
+def igv_config(run_id: str, query_id: str):
+    try:
+        return services.get_igv_config(run_id, query_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/results/{run_id}/site-query/{query_id}/igv/{resource}")
+def igv_resource(run_id: str, query_id: str, resource: str):
+    try:
+        resource_path, media_type = services.get_igv_resource_path(
+            run_id,
+            query_id,
+            resource,
+        )
+        return FileResponse(resource_path, media_type=media_type)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/results/{run_id}/report")

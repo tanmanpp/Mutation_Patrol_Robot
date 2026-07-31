@@ -36,6 +36,82 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 class CoreTests(unittest.TestCase):
+    def test_igv_config_opens_whole_gene_reference_and_alignment(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            result_dir = root / "results" / "run1"
+            query_dir = result_dir / "site_query" / "gene1_whole_gene"
+            query_dir.mkdir(parents=True)
+            (result_dir / "tables").mkdir()
+            bam_path = result_dir / "work" / "bam" / "merged.sorted.bam"
+            bam_path.parent.mkdir(parents=True)
+            bam_path.write_bytes(b"BAM")
+            bam_index = Path(str(bam_path) + ".bai")
+            bam_index.write_bytes(b"BAI")
+
+            reference_path = root / "reference.fa"
+            reference_path.write_text(
+                ">chr1\n" + ("A" * 300) + "\n",
+                encoding="utf-8",
+            )
+            reference_index = Path(str(reference_path) + ".fai")
+            reference_index.write_text(
+                "chr1\t300\t6\t300\t301\n",
+                encoding="utf-8",
+            )
+            database_path = root / "gene_database.json"
+            database_path.write_text(json.dumps({
+                "reference_fasta": str(reference_path),
+                "genes": [{
+                    "symbol": "gene1",
+                    "chrom": "chr1",
+                    "resolved_chrom": "chr1",
+                    "strand": "-",
+                    "gene_start": 100,
+                    "gene_end": 200,
+                }],
+            }), encoding="utf-8")
+            (query_dir / "igv_context.json").write_text(json.dumps({
+                "query_type": "gene_region",
+                "database": "test_database",
+                "gene_database": str(database_path),
+                "reference_fasta": str(reference_path),
+                "bam": str(bam_path),
+                "gene": "gene1",
+                "chrom": "chr1",
+                "start": 100,
+                "end": 200,
+            }), encoding="utf-8")
+
+            with patch.object(services, "RESULTS_DIR", root / "results"):
+                config = services.get_igv_config(
+                    "run1",
+                    "gene1_whole_gene",
+                )
+                alignment_path, media_type = (
+                    services.get_igv_resource_path(
+                        "run1",
+                        "gene1_whole_gene",
+                        "alignment",
+                    )
+                )
+
+            self.assertEqual(config["locus"], "chr1:50-250")
+            self.assertEqual(config["gene"], "gene1")
+            self.assertEqual(config["strand"], "-")
+            self.assertTrue(
+                config["reference"]["fasta_url"].endswith(
+                    "/igv/reference"
+                )
+            )
+            self.assertTrue(
+                config["alignment"]["index_url"].endswith(
+                    "/igv/alignment-index"
+                )
+            )
+            self.assertEqual(alignment_path, bam_path)
+            self.assertEqual(media_type, "application/octet-stream")
+
     def test_amino_acid_rows_sort_from_n_to_c_terminus(self):
         rows = [
             {"gene": "minus", "aa_pos": "10", "cds_pos": "30", "pos": "100"},

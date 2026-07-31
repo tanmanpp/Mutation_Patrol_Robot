@@ -153,6 +153,16 @@ nav button.active {
   max-width: 280px;
 }
 
+.sectionControls {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+}
+
+.sectionControls select {
+  min-width: 240px;
+}
+
 h2,
 h3 {
   margin: 0;
@@ -394,6 +404,40 @@ input[type="file"] {
   grid-column: 1 / -1;
 }
 
+.igvPanel {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+  padding: 16px;
+  border: 1px solid #b8cec7;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.igvLocus {
+  margin: 4px 0 0;
+  color: #5a6d72;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 13px;
+}
+
+.igvContainer {
+  min-height: 620px;
+  overflow: hidden;
+  border: 1px solid #d1ded9;
+  border-radius: 7px;
+  background: #ffffff;
+}
+
+.errorBox {
+  padding: 11px 13px;
+  border: 1px solid #d99a82;
+  border-radius: 7px;
+  background: #fff4ef;
+  color: #842f18;
+  line-height: 1.45;
+}
+
 .chartTooltip {
   display: grid;
   gap: 4px;
@@ -497,6 +541,15 @@ th {
   .sectionHeader {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .sectionControls {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .sectionControls select {
+    min-width: 0;
   }
 
   .sectionHeader select {

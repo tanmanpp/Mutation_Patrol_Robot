@@ -13,6 +13,26 @@ def bam_index_candidates(bam_path: Path):
     ]
 
 
+def fasta_index_path(fasta_path: Path):
+    return Path(str(Path(fasta_path)) + ".fai")
+
+
+def ensure_fasta_index(fasta_path: Path, logger, dry_run: bool = False):
+    fasta_path = Path(fasta_path)
+    index_path = fasta_index_path(fasta_path)
+    if (
+        index_path.exists()
+        and index_path.stat().st_mtime >= fasta_path.stat().st_mtime
+    ):
+        return index_path
+    run_cmd(
+        ["samtools", "faidx", str(fasta_path)],
+        logger=logger,
+        dry_run=dry_run,
+    )
+    return index_path
+
+
 def ensure_bam_index(bam_path: Path, logger, dry_run: bool = False):
     bam_path = Path(bam_path)
     if any(path.exists() for path in bam_index_candidates(bam_path)):
