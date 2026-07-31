@@ -324,6 +324,23 @@ CSV** for the untruncated file. Coding rows include:
 - one-letter amino-acid codes and amino-acid names
 - formatted amino-acid change
 
+### Open a Whole Gene Scan in IGV
+
+After a Whole Gene Scan completes, open the scan on the **Results** page and
+select **Open in IGV**. The embedded IGV.js viewer automatically:
+
+- loads the reference FASTA and its `.fai` index
+- loads the run's `merged.sorted.bam` and BAM index
+- centers the browser on the selected gene with a small flanking interval
+- opens the reference sequence three-frame translation by default and follows
+  the annotated gene strand
+- displays read coverage, alignments, mismatches, insertions, and deletions
+
+The FASTA index is created automatically when a gene database is built. Existing
+databases are indexed the first time their scan is opened in IGV. IGV reads only
+the required byte ranges from large FASTA and BAM files; those local files are
+not uploaded to an external service.
+
 The original targeted mode remains available when a user wants to inspect a
 specific position even if it does not appear in the whole-gene scan.
 
