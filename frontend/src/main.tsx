@@ -1207,24 +1207,30 @@ function App() {
   return (
     <main className="shell">
       <aside className="sidebar">
-        <div>
-          <h1>Mutation Patrol Robot</h1>
-          <p>Configurable gene database, mutation browsing, and coverage inspection.</p>
+        <div className="brand">
+          <div className="brandMark" aria-hidden="true">MP</div>
+          <div>
+            <span className="brandEyebrow">Genomic workspace</span>
+            <h1>Mutation Patrol Robot</h1>
+            <p>Mutation browsing and coverage inspection.</p>
+          </div>
         </div>
-        <nav>
+        <nav aria-label="Primary navigation">
           {[
-            ["database", "Gene Database"],
-            ["analysis", "Sample Analysis"],
-            ["query", "Whole Gene Scan"],
-            ["coverage", "Coverage"],
-            ["results", "Results"],
-          ].map(([id, label]) => (
+            ["database", "Gene Database", "DB"],
+            ["analysis", "Sample Analysis", "SA"],
+            ["query", "Whole Gene Scan", "GS"],
+            ["coverage", "Coverage", "CV"],
+            ["results", "Results", "RS"],
+          ].map(([id, label, shortLabel]) => (
             <button className={active === id ? "active" : ""} key={id} onClick={() => setActive(id)}>
-              {label}
+              <span className="navIcon" aria-hidden="true">{shortLabel}</span>
+              <span>{label}</span>
             </button>
           ))}
         </nav>
         <div className="status">
+          <span className="statusLabel"><i aria-hidden="true" /> Activity</span>
           <strong>{status}</strong>
           <ul>
             {statusLog.map((item, index) => <li key={`${item}-${index}`}>{item}</li>)}
@@ -1524,9 +1530,31 @@ function App() {
                 </button>
               </div>
             </div>
-            <div className="resultMeta">
-              <span>Sample name</span>
-              <strong>{result?.run_id || "No sample loaded"}</strong>
+            <div className="resultMetaBar">
+              <div className="resultMeta">
+                <span>Sample name</span>
+                <strong>{result?.run_id || "No sample loaded"}</strong>
+              </div>
+              <label className="resultMeta resultScanSelector">
+                <span>Gene scan result</span>
+                <select
+                  value={selectedSiteQuery?.query_id || ""}
+                  onChange={(event) => setSelectedSiteQueryId(event.target.value)}
+                  disabled={!(result?.site_queries || []).length}
+                  title="Select a Whole Gene Scan or Site Query previously completed for this sample."
+                >
+                  <option value="">
+                    {(result?.site_queries || []).length
+                      ? "Select gene scan"
+                      : "No gene scan available"}
+                  </option>
+                  {(result?.site_queries || []).map((query) => (
+                    <option key={query.query_id} value={query.query_id}>
+                      {siteQueryDisplayName(query)}
+                    </option>
+                  ))}
+                </select>
+              </label>
             </div>
             <h3>Sample Summary</h3>
             <DataTable rows={result?.sample_summary || []} empty="No sample summary loaded." />
@@ -1535,15 +1563,6 @@ function App() {
             <div className="sectionHeader">
               <h3>Gene Scan / Site Query</h3>
               <div className="sectionControls">
-                <select
-                  value={selectedSiteQuery?.query_id || ""}
-                  onChange={(event) => setSelectedSiteQueryId(event.target.value)}
-                >
-                  <option value="">Select site query</option>
-                  {(result?.site_queries || []).map((query) => (
-                    <option key={query.query_id} value={query.query_id}>{siteQueryDisplayName(query)}</option>
-                  ))}
-                </select>
                 {selectedSiteQuery?.scan_summary?.scan_type === "whole_gene" && (
                   <button
                     className="primary"
