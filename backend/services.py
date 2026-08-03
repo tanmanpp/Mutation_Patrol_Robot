@@ -403,6 +403,7 @@ def query_sites(
     summary_path = out_dir / "scan_summary.json"
     no_call_path = out_dir / "no_call_regions.csv"
     complete_table_path = out_dir / "complete_gene_table.csv"
+    protein_haplotype_path = out_dir / "protein_haplotypes.csv"
     if summary_path.exists():
         response["scan_summary"] = make_json_safe(
             json.loads(summary_path.read_text(encoding="utf-8"))
@@ -413,6 +414,11 @@ def query_sites(
         response["complete_table"] = relative_path(complete_table_path)
         response["complete_rows"] = read_csv_records(
             complete_table_path, limit=1000
+        )
+    if protein_haplotype_path.exists():
+        response["protein_haplotypes"] = relative_path(protein_haplotype_path)
+        response["protein_haplotype_rows"] = read_csv_records(
+            protein_haplotype_path, limit=500
         )
     return response
 
@@ -611,6 +617,13 @@ def read_site_queries(result_dir: Path):
             "complete_rows": read_csv_records(
                 query_dir / "complete_gene_table.csv", limit=1000
             ),
+            "protein_haplotypes": (
+                relative_path(query_dir / "protein_haplotypes.csv")
+                if (query_dir / "protein_haplotypes.csv").exists() else ""
+            ),
+            "protein_haplotype_rows": read_csv_records(
+                query_dir / "protein_haplotypes.csv", limit=500
+            ),
         })
     return items
 
@@ -622,6 +635,17 @@ def get_complete_gene_table_path(run_id: str, query_id: str):
     if not table_path.exists():
         raise FileNotFoundError(
             f"Complete gene table not found: {run_id}/{query_id}"
+        )
+    return table_path
+
+
+def get_protein_haplotype_table_path(run_id: str, query_id: str):
+    result_dir = RESULTS_DIR / safe_name(run_id)
+    query_dir = result_dir / "site_query" / safe_name(query_id)
+    table_path = query_dir / "protein_haplotypes.csv"
+    if not table_path.exists():
+        raise FileNotFoundError(
+            f"Protein haplotype table not found: {run_id}/{query_id}"
         )
     return table_path
 

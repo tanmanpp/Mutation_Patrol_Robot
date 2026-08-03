@@ -349,6 +349,23 @@ def complete_gene_table(run_id: str, query_id: str):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@app.get("/api/results/{run_id}/site-query/{query_id}/protein-haplotypes")
+def protein_haplotype_table(run_id: str, query_id: str):
+    try:
+        table_path = services.get_protein_haplotype_table_path(run_id, query_id)
+        filename = (
+            f"{services.safe_name(run_id)}_"
+            f"{services.safe_name(query_id)}_protein_haplotypes.csv"
+        )
+        return FileResponse(
+            table_path,
+            media_type="text/csv",
+            filename=filename,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @app.get("/api/results/{run_id}/site-query/{query_id}/igv")
 def igv_config(run_id: str, query_id: str):
     try:

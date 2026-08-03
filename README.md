@@ -288,6 +288,14 @@ positions, and reports every supported SNV, insertion, deletion, and
 thousands of table rows. Low-depth and uncovered positions are compressed into
 `NO_CALL` regions so missing evidence remains visible.
 
+When a coding insertion or deletion is detected, the scan also reconstructs
+local CDS haplotypes from reads spanning the complete event cluster. Nearby
+indels and substitutions are translated together, so compensating indels are
+reported as `FRAME_RESTORED` with their observed amino-acid changes instead of
+as separate persistent frameshifts. An uncompensated indel remains
+`PERSISTENT_FRAMESHIFT`; clusters without enough spanning reads are reported as
+`PHASE_UNRESOLVED` rather than guessed.
+
 Command-line whole-gene scan:
 
 ```bash
@@ -311,6 +319,9 @@ complete_gene_table.csv
                      every genomic position and reported allele row
 scan_summary.json    callable, variant, mixed-signal, and NO_CALL counts
 no_call_regions.csv  consecutive low-depth or uncovered intervals
+protein_haplotypes.csv
+                     phased read support, reconstructed CDS/peptides, frame
+                     status, and combined amino-acid changes for coding indels
 ```
 
 The Results page previews the complete table and provides **Export Complete
@@ -323,6 +334,14 @@ CSV** for the untruncated file. Coding rows include:
 - reference and alternate codons
 - one-letter amino-acid codes and amino-acid names
 - formatted amino-acid change
+
+The Results page also shows **Protein Haplotype Translation** for coding indel
+clusters. For example, an insertion and deletion carried by the same reads may
+restore the frame and produce several amino-acid substitutions. The raw
+insertion/deletion rows remain available as alignment evidence, while the
+haplotype table reports the combined sample peptide and its read proportion.
+Multiple supported protein haplotypes are labelled `MIXED_SIGNAL`; this does not
+diagnose mixed infection or drug resistance.
 
 ### Open a Whole Gene Scan in IGV
 

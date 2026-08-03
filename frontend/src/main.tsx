@@ -55,6 +55,8 @@ type SiteQueryResult = {
   no_call_regions?: Record<string, string>[];
   complete_table?: string;
   complete_rows?: Record<string, string>[];
+  protein_haplotypes?: string;
+  protein_haplotype_rows?: Record<string, string>[];
 };
 
 type UploadStats = {
@@ -460,7 +462,9 @@ function scanSummaryRows(summary: Record<string, unknown> | undefined) {
     "callable_positions", "callable_percent", "no_call_positions",
     "no_call_regions", "reference_only_positions", "variant_sites",
     "variant_rows", "complete_table_rows", "mixed_signal_sites",
-    "variant_type_counts",
+    "variant_type_counts", "protein_haplotype_clusters",
+    "protein_haplotype_rows", "frame_restored_haplotypes",
+    "persistent_frameshift_haplotypes",
   ];
   return preferred
     .filter((key) => summary[key] !== undefined)
@@ -907,6 +911,7 @@ function App() {
   const selectedScanSummaryRows = scanSummaryRows(selectedSiteQuery?.scan_summary);
   const selectedNoCallRegions = selectedSiteQuery?.no_call_regions || [];
   const selectedCompleteRows = selectedSiteQuery?.complete_rows || [];
+  const selectedProteinHaplotypeRows = selectedSiteQuery?.protein_haplotype_rows || [];
   const selectedAminoAcidRows = aminoAcidDetailRows(selectedSiteQueryRows);
   const selectedCoverageRegions = (result?.coverage_regions || []).filter(
     (row) => row["Gene symbol"] === coverageGene,
@@ -1140,6 +1145,19 @@ function App() {
       "_blank",
     );
     pushStatus(`Complete gene table requested: ${selectedSiteQuery.query_id}`);
+  }
+
+  function downloadProteinHaplotypeTable() {
+    if (!result?.run_id || !selectedSiteQuery?.query_id || !selectedSiteQuery.protein_haplotypes) {
+      pushStatus("No protein haplotype table is available.");
+      return;
+    }
+    window.open(
+      `${API_BASE}/api/results/${encodeURIComponent(result.run_id)}`
+      + `/site-query/${encodeURIComponent(selectedSiteQuery.query_id)}/protein-haplotypes`,
+      "_blank",
+    );
+    pushStatus(`Protein haplotype table requested: ${selectedSiteQuery.query_id}`);
   }
 
   async function openIgvViewer() {
@@ -1570,6 +1588,29 @@ function App() {
               rows={selectedAminoAcidRows}
               empty="No coding-region amino-acid changes were detected."
             />
+            {selectedSiteQuery?.protein_haplotypes && (
+              <>
+                <div className="sectionHeader">
+                  <h3>Protein Haplotype Translation</h3>
+                  <button type="button" onClick={downloadProteinHaplotypeTable}>
+                    Export Protein Haplotypes
+                  </button>
+                </div>
+                <div className="infoBox">
+                  Indels and nearby substitutions are reconstructed together from
+                  reads spanning the complete event cluster. FRAME_RESTORED means
+                  that an insertion/deletion combination returns to the original
+                  reading frame. PERSISTENT_FRAMESHIFT is reported only when the
+                  reconstructed sample CDS remains out of frame. Multiple supported
+                  protein haplotypes are shown as MIXED_SIGNAL without diagnosing
+                  mixed infection or drug resistance.
+                </div>
+                <PaginatedSortableTable
+                  rows={selectedProteinHaplotypeRows}
+                  empty="No coding indel cluster required protein haplotype reconstruction."
+                />
+              </>
+            )}
             {selectedSiteQuery?.complete_table && (
               <>
                 <div className="sectionHeader">

@@ -244,6 +244,13 @@ def load_site_queries(result_dir: Path):
                 read_csv_records(query_dir / "complete_gene_table.csv")[:1000]
                 if (query_dir / "complete_gene_table.csv").exists() else []
             ),
+            "protein_haplotype_path": (
+                query_dir / "protein_haplotypes.csv"
+                if (query_dir / "protein_haplotypes.csv").exists() else None
+            ),
+            "protein_haplotype_rows": read_csv_records(
+                query_dir / "protein_haplotypes.csv"
+            ),
         })
     return queries
 
@@ -347,6 +354,28 @@ def render_html_report(result_dir: Path, out_html: Path | None = None):
                     "No coding-region changes found.",
                 ),
             ])
+            if item["protein_haplotype_path"]:
+                relative_haplotypes = item["protein_haplotype_path"].relative_to(
+                    result_dir
+                ).as_posix()
+                sections.extend([
+                    "<h4>Protein Haplotype Translation</h4>",
+                    (
+                        "<p class=\"subtle\">Nearby indels and substitutions are "
+                        "translated together from reads spanning the complete event "
+                        "cluster. FRAME_RESTORED is not reported as a persistent "
+                        "frameshift. MIXED_SIGNAL does not diagnose mixed infection "
+                        "or drug resistance.</p>"
+                    ),
+                    (
+                        f'<p><a href="{esc(relative_haplotypes)}">'
+                        "Open protein haplotype CSV</a></p>"
+                    ),
+                    table_html(
+                        item["protein_haplotype_rows"],
+                        "No coding indel cluster required protein haplotype reconstruction.",
+                    ),
+                ])
             if item["complete_table_path"]:
                 relative_complete = item["complete_table_path"].relative_to(
                     result_dir

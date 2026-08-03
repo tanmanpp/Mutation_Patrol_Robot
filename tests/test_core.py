@@ -21,6 +21,7 @@ from modules.gene_database import (
     load_gene_database,
 )
 from modules.site_query import (
+    _apply_protein_haplotype_annotations,
     _biological_position_sort_key,
     _codon_rows_for_aa_queries,
     _compress_no_call_regions,
@@ -36,6 +37,55 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 class CoreTests(unittest.TestCase):
+    def test_phased_haplotype_supersedes_provisional_site_effects(self):
+        variants = [
+            {
+                "region_type": "CDS",
+                "variant_type": "INS",
+                "pos": "403618",
+                "aa_pos": "74",
+                "effect": "frameshift",
+                "aa_change": "M74fs",
+                "qc_flags": "PASS",
+                "note": "raw insertion",
+            },
+            {
+                "region_type": "CDS",
+                "variant_type": "SNV",
+                "pos": "403625",
+                "aa_pos": "76",
+                "effect": "missense",
+                "aa_change": "K76T",
+                "qc_flags": "PASS",
+                "note": "raw substitution",
+            },
+        ]
+        haplotypes = [{
+            "cluster_id": "C1",
+            "cluster_start": "403618",
+            "cluster_end": "403622",
+            "phase_status": "PHASED",
+            "call_status": "VARIANT",
+            "haplotype_frequency": "0.987667",
+            "aa_start": "74",
+            "aa_end": "76",
+            "effect": "frame_restored_complex",
+            "aa_changes": "M74I; N75E; K76T",
+            "combined_aa_change": "M74_K76delinsIET",
+        }]
+
+        _apply_protein_haplotype_annotations(variants, haplotypes)
+
+        self.assertTrue(all(
+            row["aa_change"] == "M74I; N75E; K76T"
+            for row in variants
+        ))
+        self.assertTrue(all(
+            "HAPLOTYPE_RECONSTRUCTED" in row["qc_flags"]
+            for row in variants
+        ))
+        self.assertIn("site_level_aa_change=M74fs", variants[0]["note"])
+
     def test_igv_config_opens_whole_gene_reference_and_alignment(self):
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -451,6 +501,8 @@ class CoreTests(unittest.TestCase):
             )
             self.assertEqual(len(complete_rows), 5)
             self.assertEqual(summary["complete_table_rows"], 5)
+            self.assertEqual(summary["protein_haplotype_rows"], 0)
+            self.assertTrue(outputs["protein_haplotypes"].exists())
             self.assertEqual(
                 {row["call_status"] for row in complete_rows},
                 {"REFERENCE", "MIXED_SIGNAL", "NO_CALL"},

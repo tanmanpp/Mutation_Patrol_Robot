@@ -14,6 +14,10 @@ from modules.gene_database import (
     reverse_complement,
     translate_dna,
 )
+from modules.haplotype_translate import (
+    build_protein_haplotypes,
+    write_protein_haplotypes,
+)
 from modules.utils import ensure_dir, resolve_project_path, run_cmd
 
 
@@ -725,6 +729,100 @@ def _compress_no_call_regions(gene: str,
     return output
 
 
+def _apply_protein_haplotype_annotations(variant_rows: list[dict],
+                                         haplotype_rows: list[dict]):
+    """Replace provisional site-level protein effects with phased consequences."""
+    by_cluster = {}
+    for row in haplotype_rows:
+        cluster_id = row.get("cluster_id")
+        if cluster_id:
+            by_cluster.setdefault(cluster_id, []).append(row)
+
+    for cluster_id, cluster_rows in by_cluster.items():
+        resolved_rows = [
+            row for row in cluster_rows
+            if row.get("phase_status") == "PHASED"
+        ]
+        call_status = cluster_rows[0].get("call_status") or "NO_CALL"
+        aa_positions = [
+            value
+            for row in resolved_rows
+            for value in (
+                _optional_int(row.get("aa_start")),
+                _optional_int(row.get("aa_end")),
+            )
+            if value is not None
+        ]
+        aa_start = min(aa_positions) if aa_positions else None
+        aa_end = max(aa_positions) if aa_positions else None
+        genomic_start = min(
+            _optional_int(row.get("cluster_start")) or 0
+            for row in cluster_rows
+        )
+        genomic_end = max(
+            _optional_int(row.get("cluster_end")) or 0
+            for row in cluster_rows
+        )
+        dominant = max(
+            resolved_rows,
+            key=lambda row: float(row.get("haplotype_frequency") or 0),
+            default=None,
+        )
+
+        for variant_row in variant_rows:
+            if variant_row.get("region_type") != "CDS":
+                continue
+            row_aa_pos = _optional_int(variant_row.get("aa_pos"))
+            row_genomic_pos = _optional_int(variant_row.get("pos"))
+            in_aa_range = (
+                aa_start is not None
+                and aa_end is not None
+                and row_aa_pos is not None
+                and aa_start <= row_aa_pos <= aa_end
+            )
+            is_cluster_indel = (
+                variant_row.get("variant_type") in {"INS", "DEL"}
+                and row_genomic_pos is not None
+                and genomic_start <= row_genomic_pos <= genomic_end
+            )
+            if not in_aa_range and not is_cluster_indel:
+                continue
+
+            original_change = variant_row.get("aa_change") or ""
+            original_effect = variant_row.get("effect") or ""
+            note = variant_row.get("note") or ""
+            note += (
+                f"; site_level_effect={original_effect}; "
+                f"site_level_aa_change={original_change}; "
+                f"see protein haplotype {cluster_id}"
+            )
+            variant_row["note"] = note.lstrip("; ")
+            qc_flags = [
+                value for value in (variant_row.get("qc_flags") or "").split(";")
+                if value and value != "PASS"
+            ]
+
+            if call_status == "MIXED_SIGNAL":
+                variant_row["effect"] = "haplotype_mixed"
+                variant_row["aa_change"] = (
+                    f"See {cluster_id} protein haplotypes (MIXED_SIGNAL)"
+                )
+                qc_flags.append("MULTIPLE_HAPLOTYPES")
+            elif dominant is None:
+                variant_row["effect"] = "no_call"
+                variant_row["aa_change"] = "Unable to determine (PHASE_UNRESOLVED)"
+                qc_flags.append("PHASE_UNRESOLVED")
+            else:
+                variant_row["effect"] = dominant.get("effect") or original_effect
+                variant_row["aa_change"] = (
+                    dominant.get("aa_changes")
+                    or dominant.get("combined_aa_change")
+                    or original_change
+                )
+                qc_flags.append("HAPLOTYPE_RECONSTRUCTED")
+            variant_row["qc_flags"] = ";".join(dict.fromkeys(qc_flags)) or "PASS"
+
+
 def _rows_for_site(gene: str,
                    gene_record: dict,
                    gene_db: dict,
@@ -1019,11 +1117,13 @@ def scan_bam_gene_region(gene_db_path: Path,
     summary_path = out_csv.parent / "scan_summary.json"
     no_call_csv = out_csv.parent / "no_call_regions.csv"
     complete_table_csv = out_csv.parent / "complete_gene_table.csv"
+    protein_haplotype_csv = out_csv.parent / "protein_haplotypes.csv"
     if (
         out_csv.exists()
         and summary_path.exists()
         and no_call_csv.exists()
         and complete_table_csv.exists()
+        and protein_haplotype_csv.exists()
         and not force
     ):
         logger.info(f"Whole-gene scan exists, skip: {out_csv}")
@@ -1032,6 +1132,7 @@ def scan_bam_gene_region(gene_db_path: Path,
             "summary": summary_path,
             "no_call_regions": no_call_csv,
             "complete_table": complete_table_csv,
+            "protein_haplotypes": protein_haplotype_csv,
         }
 
     gene_db = load_gene_database(gene_db_path)
@@ -1128,6 +1229,22 @@ def scan_bam_gene_region(gene_db_path: Path,
     no_call_regions = _compress_no_call_regions(
         gene, chrom, no_call_positions, min_depth
     )
+    protein_haplotype_rows = build_protein_haplotypes(
+        gene=gene,
+        gene_record=gene_record,
+        variant_rows=variant_rows,
+        bam_path=bam_path,
+        min_mapq=min_mapq,
+        min_alt_freq=min_alt_freq,
+        min_depth=min_depth,
+        min_baseq=min_baseq,
+        min_allele_count=min_allele_count,
+        logger=logger,
+    )
+    _apply_protein_haplotype_annotations(
+        variant_rows,
+        protein_haplotype_rows,
+    )
     gene_length = end - start + 1
     summary = {
         "scan_type": "whole_gene",
@@ -1150,6 +1267,19 @@ def scan_bam_gene_region(gene_db_path: Path,
         "complete_table_rows": len(complete_rows),
         "mixed_signal_sites": len(mixed_positions),
         "variant_type_counts": variant_type_counts,
+        "protein_haplotype_clusters": len({
+            row.get("cluster_id") for row in protein_haplotype_rows
+            if row.get("cluster_id")
+        }),
+        "protein_haplotype_rows": len(protein_haplotype_rows),
+        "frame_restored_haplotypes": sum(
+            row.get("frame_status") == "FRAME_RESTORED"
+            for row in protein_haplotype_rows
+        ),
+        "persistent_frameshift_haplotypes": sum(
+            row.get("frame_status") == "PERSISTENT_FRAMESHIFT"
+            for row in protein_haplotype_rows
+        ),
         "thresholds": {
             "min_depth": min_depth,
             "min_mapq": min_mapq,
@@ -1164,6 +1294,7 @@ def scan_bam_gene_region(gene_db_path: Path,
     }
 
     ensure_dir(out_csv.parent)
+    write_protein_haplotypes(protein_haplotype_rows, protein_haplotype_csv)
     variant_rows.sort(key=_biological_position_sort_key)
     with open(out_csv, "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=FIELDNAMES)
@@ -1194,6 +1325,7 @@ def scan_bam_gene_region(gene_db_path: Path,
         "summary": summary_path,
         "no_call_regions": no_call_csv,
         "complete_table": complete_table_csv,
+        "protein_haplotypes": protein_haplotype_csv,
     }
 
 
